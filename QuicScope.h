@@ -8,6 +8,7 @@
 #include <wincrypt.h>
 #include <wininet.h>
 #pragma comment(lib,"ntdll.lib")
+#pragma comment(lib,"wininet.lib")
 #pragma comment(lib,"ws2_32.lib")
 #define USE_TURBO_PLAY_CERTIFICATE
 #endif

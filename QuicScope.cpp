@@ -43,8 +43,8 @@ int main(int argc,char** argv)
 		return 0;
 	}
 
-	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
 	std::cout << std::endl << "Press Enter to exit..." << std::endl;
+	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
 	std::cin.get();
 	return 0;
 }

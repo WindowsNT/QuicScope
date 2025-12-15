@@ -18,9 +18,6 @@ class QUIC2_BUFFER : public QUIC_BUFFER
 
 class QUIC_BUFFER_COLLECTION
 {
-
-
-
 public:
 	std::vector<QUIC_BUFFER> buffers;
 	std::vector<QUIC2_BUFFER> internalBuffers;
@@ -39,46 +36,176 @@ public:
 
 nlohmann::json jlog;
 
-class QuicConnection
+
+class QuicLog
 {
-	private:
+public:
+
+	char log[1000] = {};
+	std::shared_ptr<std::recursive_mutex> mtx = std::make_shared <std::recursive_mutex>();
+	void AddLog(HRESULT hr, const char* msg)
+	{
+		if (!mtx || !msg)
+			return;
+		std::lock_guard<std::recursive_mutex> lock(*mtx);
+		nlohmann::json je;
+		je["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::system_clock::now().time_since_epoch()
+		).count();
+		je["hr"] = hr;
+		je["msg"] = msg;
+		jlog["logs"].push_back(je);
+
+		// Output to screen
+		if (hr == S_FALSE)
+			printf("\033[33m %s.\r\n\033[0m", msg);
+		else
+			if (FAILED(hr))
+				printf("\033[31m %s [0x%08X].\r\n\033[0m", msg, hr);
+			else
+				printf("\033[32m %s.\r\n\033[0m", msg);
+	}
+
+	void FinalizeLog()
+	{
+		std::lock_guard<std::recursive_mutex> lock(*mtx);
+		if (!jlog.contains("logs"))
+			return;
+		if (Output.size() > 0)
+		{
+			std::ofstream ofs(Output, std::ios::out);
+			ofs << jlog.dump(4);
+			ofs.close();
+
+			jlog = {};
+		}
+	}
+
+};
+
+
+class QuicStream: public QuicLog
+{
+public:
+	const QUIC_API_TABLE* qt = 0;
+	HQUIC hConnection = 0;
+	HQUIC hStream = 0;
+
+	QUIC_STATUS StreamCallback(HQUIC Stream, QUIC_STREAM_EVENT* Event)
+	{
+		if (!Event)
+			return QUIC_STATUS_INVALID_PARAMETER;
+		if (Event->Type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
+		{
+			sprintf_s(log, 1000, "%p Stream Shutdown Complete", hStream);
+			AddLog(S_OK, log);
+			qt->StreamClose(hStream);
+			hStream = 0;
+			return QUIC_STATUS_SUCCESS;
+		}
+		return QUIC_STATUS_SUCCESS;
+	}
+	QuicStream(const QUIC_API_TABLE* qqt, HQUIC hConn,HQUIC hStrm)
+	{
+		qt = qqt;
+		hConnection = hConn;
+		hStream = hStrm;
+		qt->SetCallbackHandler(hStream, [](HQUIC Stream, void* Context, QUIC_STREAM_EVENT* Event) {	return ((QuicStream*)Context)->StreamCallback(Stream, Event); }, this);
+	}
+	virtual ~QuicStream()
+	{
+		if (hStream)
+			qt->StreamShutdown(hStream, QUIC_STREAM_SHUTDOWN_FLAG_NONE, 0);
+	}
+};
+
+
+class QuicConnection : public QuicLog
+{
+public:
 		const QUIC_API_TABLE* qt = 0;
 		HQUIC hConnection = 0;
+		std::vector<std::shared_ptr<QuicStream>> Streams;
 
 		QUIC_STATUS ConnectionCallback(HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
 		{
+			if (!Event)
+				return QUIC_STATUS_INVALID_PARAMETER;
+			if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED)
+			{
+				HQUIC Stream = Event->PEER_STREAM_STARTED.Stream;
+				sprintf_s(log, 1000, "%p Peer Stream Started", Stream);
+				AddLog(S_OK, log);
+				auto str = std::make_shared<QuicStream>(qt, hConnection, Stream);
+				Streams.push_back(str);
+			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
+			{
+				sprintf_s(log, 1000, "%p Connection Shutting down by transport", hConnection);
+				AddLog(E_FAIL, log);
+				return QUIC_STATUS_SUCCESS;
+			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE)
+			{
+				sprintf_s(log,1000,"%p Connection Shutdown Complete",hConnection);
+				AddLog(E_FAIL, log);
+				qt->ConnectionClose(hConnection);
+				hConnection = 0;
+				return QUIC_STATUS_SUCCESS;
+			}
 			return QUIC_STATUS_SUCCESS;
 		}
-	public:
 		QuicConnection(const QUIC_API_TABLE* qqt,HQUIC hConn)
 		{
 			qt = qqt;
 			hConnection = hConn;
 			qt->SetCallbackHandler(hConnection, [](HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event) {	return ((QuicConnection*)Context)->ConnectionCallback(Connection, Event);}, this);
 		}
+		virtual ~QuicConnection()
+		{
+			if (hConnection)
+				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+		}
 };
 
 
-class QuicCommon
+class QuicCommon : public QuicLog
 {
 private:
 
 	QUIC_BUFFER_COLLECTION AlpnBuffers;
+	std::string cert;
 
 protected:
 	const QUIC_API_TABLE* qt = 0;
 	int rp = 0;
 	HQUIC hRegistration = 0;
 	HQUIC hConfiguration = 0;
-	std::shared_ptr<std::recursive_mutex> mtx = std::make_shared <std::recursive_mutex>();
 	std::vector<std::shared_ptr<QuicConnection>> Connections;
 
-	void LoadCertificate(std::string cert_options)
+	HRESULT LoadCertificate(std::string cert_options)
 	{
+		if (!hConfiguration)
+		{
+			cert = cert_options;
+			return S_FALSE;
+		}
 		// To be implemented
 #ifdef USE_TURBO_PLAY_CERTIFICATE
+		if (cert_options == "turboplay")
+		{
+			EnsureDHTP();
+			auto cs = dhtp->RequestCertificate();
+			QUIC_CREDENTIAL_CONFIG credConfig = {};
+			credConfig.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
+			credConfig.Flags = QUIC_CREDENTIAL_FLAG_NONE;
+			credConfig.CertificateContext = (QUIC_CERTIFICATE*)std::get<1>(cs);
+			auto hr = qt->ConfigurationLoadCredential(hConfiguration, &credConfig);
+			AddLog(hr, "ConfigurationLoadCredential");
+			return hr;
+		}
 #endif
-
+		return E_NOINTERFACE;
 	}
 
 	void LoadAlpns(std::vector<std::string> alpns, QUIC_BUFFER_COLLECTION& wh)
@@ -102,46 +229,7 @@ protected:
 	}
 
 
-	void AddLog(HRESULT hr, const char* msg)
-	{
-		if (!mtx || !msg)
-			return;
-		std::lock_guard<std::recursive_mutex> lock(*mtx);
-		nlohmann::json je;
-		je["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-			std::chrono::system_clock::now().time_since_epoch()
-		).count();
-		je["hr"] = hr;
-		je["msg"] = msg;
-		jlog["logs"].push_back(je);
-
-		// Output to screen
-		if (hr == S_FALSE)
-			printf("\033[33m %s.\r\n\033[0m",msg);
-		else
-		if (FAILED(hr))
-			printf("\033[31m %s [0x%08X].\r\n\033[0m", msg, hr);
-		else
-			printf("\033[32m %s.\r\n\033[0m", msg);
-
-
-	}
-
-	void FinalizeLog()
-	{
-		std::lock_guard<std::recursive_mutex> lock(*mtx);
-		if (!jlog.contains("logs"))
-			return;
-		if (Output.size() > 0)	
-		{
-			std::ofstream ofs(Output, std::ios::out);
-			ofs << jlog.dump(4);
-			ofs.close();
-
-			jlog = {};
-		}
-	}
-
+	
 
 public:
 
@@ -179,12 +267,12 @@ public:
 		if (FAILED(hr))
 			return hr;
 
-		qt->ConfigurationLoadCredential(hConfiguration, nullptr);
-
+		hr = LoadCertificate(cert);
 		return hr;
 	}
 	virtual void End()
 	{
+		Connections.clear();
 		if (hConfiguration)
 		{
 			qt->ConfigurationClose(hConfiguration);
@@ -242,9 +330,68 @@ public:
 			return QUIC_STATUS_INVALID_PARAMETER;
 		if (Event->Type == QUIC_LISTENER_EVENT_NEW_CONNECTION)
 		{
-			AddLog(S_OK, "New Connection");
 
-			HQUIC NewConnection = Event->NEW_CONNECTION.Connection;
+			auto& evx = Event->NEW_CONNECTION;
+			HQUIC NewConnection = evx.Connection;
+			sprintf_s(log, "New connection %p", NewConnection);
+			AddLog(S_OK, log);
+			if (evx.Info)
+			{
+				auto& info = *evx.Info;
+				sprintf_s(log, " Quic Version: %i", ntohl(info.QuicVersion));
+				AddLog(S_FALSE, log);
+				if (info.LocalAddress)
+				{
+					char str_buffer[INET6_ADDRSTRLEN] = { 0 };
+					inet_ntop(info.LocalAddress->si_family == QUIC_ADDRESS_FAMILY_INET ? AF_INET : AF_INET6,
+						info.LocalAddress->si_family == QUIC_ADDRESS_FAMILY_INET ?
+						(void*)&info.LocalAddress->Ipv4.sin_addr :
+						(void*)&info.LocalAddress->Ipv6.sin6_addr,
+						str_buffer, INET6_ADDRSTRLEN);
+					sprintf_s(log, " Server Address: %s:%d", str_buffer, QuicAddrGetPort(info.LocalAddress));
+					AddLog(S_FALSE, log);
+				}
+				if (info.RemoteAddress)
+				{
+					char str_buffer[INET6_ADDRSTRLEN] = { 0 };
+					inet_ntop(info.RemoteAddress->si_family == QUIC_ADDRESS_FAMILY_INET ? AF_INET : AF_INET6,
+						info.RemoteAddress->si_family == QUIC_ADDRESS_FAMILY_INET ?
+						(void*)&info.RemoteAddress->Ipv4.sin_addr :
+						(void*)&info.RemoteAddress->Ipv6.sin6_addr,
+						str_buffer, INET6_ADDRSTRLEN);
+					sprintf_s(log, " Remote Address: %s:%d", str_buffer, QuicAddrGetPort(info.RemoteAddress));
+					AddLog(S_FALSE, log);
+				}
+				if (info.ClientAlpnList)
+				{
+					std::string alpn_list;
+					size_t offset = 0;
+					while (offset < info.ClientAlpnListLength)
+					{
+						uint8_t alpn_len = info.ClientAlpnList[offset];
+						std::string alpn((char*)&info.ClientAlpnList[offset + 1], alpn_len);
+						if (alpn_list.size() > 0)
+							alpn_list += ", ";
+						alpn_list += alpn;
+						offset += alpn_len + 1;
+					}
+					sprintf_s(log, " Client ALPNs: %s", alpn_list.c_str());
+					AddLog(S_FALSE, log);
+				}
+				if (info.NegotiatedAlpn)
+					{
+					std::string alpn((char*)info.NegotiatedAlpn, info.NegotiatedAlpnLength);
+					sprintf_s(log, " Negotiated ALPN: %s", alpn.c_str());
+					AddLog(S_FALSE, log);
+				}
+				if (info.ServerName)
+				{
+					std::string sname(info.ServerName, info.ServerNameLength);
+					sprintf_s(log, " Server Name: %s", sname.c_str());
+					AddLog(S_FALSE, log);
+				}
+			}
+
 			auto hr = qt->ConnectionSetConfiguration(NewConnection, hConfiguration);
 			if (FAILED(hr))
 			{
@@ -265,15 +412,20 @@ public:
 		if (Use4)
 		{
 			hr = qt->ListenerOpen(hRegistration, [](HQUIC Listener,void* Context,QUIC_LISTENER_EVENT* Event) { return ((QuicServer*)Context)->ListenerCallback(Listener, Event);}, this, &hListener4);
+			AddLog(hr, "ListenerOpen IPv4");
 			if (FAILED(hr))
 				return hr;
 		}
 		if (Use6)
 		{
 			hr = qt->ListenerOpen(hRegistration, [](HQUIC Listener, void* Context, QUIC_LISTENER_EVENT* Event) { return ((QuicServer*)Context)->ListenerCallback(Listener, Event); }, this, &hListener6);
+			AddLog(hr, "ListenerOpen IPv6");
 			if (FAILED(hr))
 				return hr;
 		}
+
+		sprintf_s(log, "Starting Listeners on port %d", ListenPort);
+		AddLog(S_FALSE, log);
 
 		for (auto listener : { hListener4,hListener6 })
 		{
