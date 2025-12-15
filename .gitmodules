@@ -1,0 +1,6 @@
+[submodule "msquic"]
+	path = msquic
+	url = https://github.com/microsoft/msquic
+[submodule "nghttp3"]
+	path = nghttp3
+	url = https://github.com/WindowsNT/nghttp3
