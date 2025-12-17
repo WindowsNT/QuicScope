@@ -1,6 +1,20 @@
-#include "quicscope.h"
+ #include "quicscope.h"
 
 extern std::string Output;
+
+void LuaInit()
+{
+	lua_State* L = luaL_newstate();
+	luaL_openlibs(L);
+
+	// sandbox
+	lua_pushnil(L);
+	lua_setglobal(L, "os");
+	lua_pushnil(L);
+	lua_setglobal(L, "io");
+
+	luaL_dofile(L, "policy.lua");
+}
 
 class QUIC2_BUFFER : public QUIC_BUFFER
 {
@@ -481,4 +495,14 @@ void CreateServers(const std::vector<int>& ports,int RegistrationProfile, std::v
 		Servers.push_back(s);
 	}
 }
+
+
+void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfile, std::vector<std::string> Alpns)
+{
+	for (auto& c : clnts)
+	{
+		// This is IP,Port
+	}
+}
+
 

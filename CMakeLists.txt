@@ -55,4 +55,13 @@ else()
     target_link_libraries(QuicScope PRIVATE nghttp3)
 endif()
 
+# lua
+add_subdirectory(lua EXCLUDE_FROM_ALL)
+if (QUICSCOPE_STATIC)
+    target_link_libraries(QuicScope PRIVATE lua_static)
+else()
+    target_link_libraries(QuicScope PRIVATE lua)
+endif()
+
+target_include_directories(QuicScope PRIVATE  ${CMAKE_SOURCE_DIR}/Lua/lua-5.4.7/include)
 

@@ -45,6 +45,7 @@ int main(int argc,char** argv)
 
 	std::cout << std::endl << "Press Enter to exit..." << std::endl;
 	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
+	CreateClients(Clients, RegistrationProfile, Alpns);
 	std::cin.get();
 	return 0;
 }

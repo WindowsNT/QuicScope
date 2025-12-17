@@ -13,6 +13,7 @@
 #define USE_TURBO_PLAY_CERTIFICATE
 #endif
 
+
 #include <iostream>
 #include <vector>
 #include <thread>
@@ -24,6 +25,13 @@
 #include "json.hpp"
 #include "xml3all.h"
 
+
+extern "C" {
+#include "lua.h"
+#include "lauxlib.h"
+#include "lualib.h"
+}
+
 #ifdef USE_TURBO_PLAY_CERTIFICATE
 #include "f:\\TP2\\aed\\tpdynip.hpp"
 #endif
@@ -34,3 +42,4 @@
 
 
 void CreateServers(const std::vector<int>& ports,int RegistrationProfile, std::vector<std::string> Alpns,std::string cert_options);
+void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfile, std::vector<std::string> Alpns);
