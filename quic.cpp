@@ -169,11 +169,15 @@ public:
 			}
 			return QUIC_STATUS_SUCCESS;
 		}
-		QuicConnection(const QUIC_API_TABLE* qqt,HQUIC hConn)
+		void SetConnection(HQUIC hConn,bool SetH)
+		{
+			hConnection = hConn;
+			if (SetH)
+				qt->SetCallbackHandler(hConnection, [](HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event) {	return ((QuicConnection*)Context)->ConnectionCallback(Connection, Event); }, this);
+		}
+		QuicConnection(const QUIC_API_TABLE* qqt)
 		{
 			qt = qqt;
-			hConnection = hConn;
-			qt->SetCallbackHandler(hConnection, [](HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event) {	return ((QuicConnection*)Context)->ConnectionCallback(Connection, Event);}, this);
 		}
 		virtual ~QuicConnection()
 		{
@@ -219,7 +223,13 @@ protected:
 			return hr;
 		}
 #endif
-		return E_NOINTERFACE;
+
+		QUIC_CREDENTIAL_CONFIG credConfig = {};
+		credConfig.Type = QUIC_CREDENTIAL_TYPE_NONE;
+		credConfig.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+		auto hr = qt->ConfigurationLoadCredential(hConfiguration, &credConfig);
+		AddLog(hr, "ConfigurationLoadCredential");
+		return hr;
 	}
 
 	void LoadAlpns(std::vector<std::string> alpns, QUIC_BUFFER_COLLECTION& wh)
@@ -412,7 +422,8 @@ public:
 				AddLog(hr, "ConnectionSetConfiguration");
 				return hr;
 			}
-			auto conn = std::make_shared<QuicConnection>(qt,NewConnection);
+			auto conn = std::make_shared<QuicConnection>(qt);
+			conn->SetConnection(NewConnection,true);
 			Connections.push_back(conn);
 			return QUIC_STATUS_SUCCESS;
 		}
@@ -472,19 +483,51 @@ public:
 
 class QuicClient : public QuicCommon
 {
+	std::string host;
+	int port = 0;
 public:
-	QuicClient(int RegistrationProfile, std::vector<std::string> Alpns) : QuicCommon(RegistrationProfile,Alpns)
+	QuicClient(std::string _host,int _port,int RegistrationProfile, std::vector<std::string> Alpns) : QuicCommon(RegistrationProfile,Alpns)
 	{
+		host = _host;
+		port = _port;
 	}
 	~QuicClient()
 	{
 		End();
 	}
+	virtual HRESULT Begin() override
+	{
+		auto hr = QuicCommon::Begin();
+		if (FAILED(hr))
+			return hr;
+		// Connect to host:port
+		HQUIC hConnection = 0;
 
+		auto connection = std::make_shared<QuicConnection>(qt);
+		hr = qt->ConnectionOpen(hRegistration, [](
+			_In_ HQUIC Connection,
+			_In_opt_ void* Context,
+			_Inout_ QUIC_CONNECTION_EVENT* Event
+			)
+			{
+				QuicConnection* conn = (QuicConnection*)Context;
+				return conn->ConnectionCallback(Connection, Event);
+			}, connection.get(), &hConnection);
+		AddLog(hr, "ConnectionOpen");
+		if (!hConnection)
+			return E_FAIL;	
+		connection->SetConnection(hConnection,false);
+		Connections.push_back(connection);
+		hr = qt->ConnectionStart(hConnection, hConfiguration, strchr(host.c_str(), ':') ? QUIC_ADDRESS_FAMILY_INET6 : QUIC_ADDRESS_FAMILY_INET,
+			host.c_str(), port);
+		sprintf_s(log, "%p Starting connection to %s:%d",hConnection, host.c_str(), port);
+		AddLog(hr, log);
+	}
 };
 
 
 std::vector<std::shared_ptr<QuicServer>> Servers;
+std::vector<std::shared_ptr<QuicClient>> Clients;
 
 void CreateServers(const std::vector<int>& ports,int RegistrationProfile, std::vector<std::string> Alpns, std::string cert_options)
 {
@@ -502,6 +545,14 @@ void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfil
 	for (auto& c : clnts)
 	{
 		// This is IP,Port
+		auto pos = c.find(',');
+		if (pos == std::string::npos)
+			continue;
+		std::string host = c.substr(0, pos);
+		int port = atoi(c.substr(pos + 1).c_str());
+		auto cl = std::make_shared<QuicClient>(host, port, RegistrationProfile, Alpns);
+		cl->Begin();
+		Clients.push_back(cl);
 	}
 }
 
