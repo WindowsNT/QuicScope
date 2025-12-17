@@ -4,3 +4,6 @@
 [submodule "nghttp3"]
 	path = nghttp3
 	url = https://github.com/WindowsNT/nghttp3
+[submodule "Lua"]
+	path = Lua
+	url = https://github.com/walterschell/Lua
