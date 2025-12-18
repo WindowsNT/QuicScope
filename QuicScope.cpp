@@ -43,9 +43,9 @@ int main(int argc,char** argv)
 		return 0;
 	}
 
-	std::cout << std::endl << "Press Enter to exit..." << std::endl;
+	std::cout << std::endl << "Enter help for commands, quit to exit..." << std::endl;
 	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
 	CreateClients(Clients, RegistrationProfile, Alpns);
-	std::cin.get();
+	Loop();
 	return 0;
 }

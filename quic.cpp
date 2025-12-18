@@ -1,6 +1,10 @@
  #include "quicscope.h"
 
 extern std::string Output;
+class QuicServer;
+class QuicClient;
+std::shared_ptr<QuicServer> CurrentServer = nullptr;
+std::shared_ptr<QuicClient> CurrentClient = nullptr;
 
 void LuaInit()
 {
@@ -51,17 +55,17 @@ public:
 nlohmann::json jlog;
 
 
+std::recursive_mutex mtx;
 class QuicLog
 {
 public:
 
 	char log[1000] = {};
-	std::shared_ptr<std::recursive_mutex> mtx = std::make_shared <std::recursive_mutex>();
 	void AddLog(HRESULT hr, const char* msg)
 	{
-		if (!mtx || !msg)
+		if (!msg)
 			return;
-		std::lock_guard<std::recursive_mutex> lock(*mtx);
+		std::lock_guard<std::recursive_mutex> lock(mtx);
 		nlohmann::json je;
 		je["t"] = std::chrono::duration_cast<std::chrono::milliseconds>(
 			std::chrono::system_clock::now().time_since_epoch()
@@ -82,7 +86,7 @@ public:
 
 	void FinalizeLog()
 	{
-		std::lock_guard<std::recursive_mutex> lock(*mtx);
+		std::lock_guard<std::recursive_mutex> lock(mtx);
 		if (!jlog.contains("logs"))
 			return;
 		if (Output.size() > 0)
@@ -156,16 +160,24 @@ public:
 			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
 			{
 				sprintf_s(log, 1000, "%p Connection Shutting down by transport", hConnection);
-				AddLog(E_FAIL, log);
+				AddLog(Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status, log);
 				return QUIC_STATUS_SUCCESS;
 			}
 			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE)
 			{
 				sprintf_s(log,1000,"%p Connection Shutdown Complete",hConnection);
-				AddLog(E_FAIL, log);
+				AddLog(S_FALSE, log);
 				qt->ConnectionClose(hConnection);
 				hConnection = 0;
 				return QUIC_STATUS_SUCCESS;
+			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED)
+			{
+				sprintf_s(log, 1000, "%p Connection Connected", hConnection);
+				AddLog(S_OK, log);
+				if (Event->CONNECTED.NegotiatedAlpn)
+					sprintf_s(log, 1000, " Alpn: %s", Event->CONNECTED.NegotiatedAlpn);
+				AddLog(S_FALSE, log);
 			}
 			return QUIC_STATUS_SUCCESS;
 		}
@@ -195,7 +207,6 @@ private:
 	std::string cert;
 
 protected:
-	const QUIC_API_TABLE* qt = 0;
 	int rp = 0;
 	HQUIC hRegistration = 0;
 	HQUIC hConfiguration = 0;
@@ -256,6 +267,11 @@ protected:
 	
 
 public:
+
+	const QUIC_API_TABLE* qt = 0;
+	std::vector<std::shared_ptr<QuicConnection>>& GetConnections() {
+		return Connections;
+	};
 
 	QuicCommon(int RegistrationProfile, std::vector<std::string> alpns)
 	{
@@ -354,7 +370,6 @@ public:
 			return QUIC_STATUS_INVALID_PARAMETER;
 		if (Event->Type == QUIC_LISTENER_EVENT_NEW_CONNECTION)
 		{
-
 			auto& evx = Event->NEW_CONNECTION;
 			HQUIC NewConnection = evx.Connection;
 			sprintf_s(log, "New connection %p", NewConnection);
@@ -519,9 +534,10 @@ public:
 		connection->SetConnection(hConnection,false);
 		Connections.push_back(connection);
 		hr = qt->ConnectionStart(hConnection, hConfiguration, strchr(host.c_str(), ':') ? QUIC_ADDRESS_FAMILY_INET6 : QUIC_ADDRESS_FAMILY_INET,
-			host.c_str(), port);
+			host.c_str(), (uint16_t)port);
 		sprintf_s(log, "%p Starting connection to %s:%d",hConnection, host.c_str(), port);
 		AddLog(hr, log);
+		return hr;
 	}
 };
 
@@ -536,6 +552,13 @@ void CreateServers(const std::vector<int>& ports,int RegistrationProfile, std::v
 		auto s = std::make_shared<QuicServer>(p, 2,RegistrationProfile,Alpns,cert_options);
 		s->Begin();
 		Servers.push_back(s);
+	}
+	if (Servers.size() > 0)
+	{
+		auto b = Servers.size();
+		CurrentServer = Servers[b - 1];
+		printf("Server #%zd is now the default server, change with 's default <n>' command.\r\n", b);
+
 	}
 }
 
@@ -554,6 +577,95 @@ void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfil
 		cl->Begin();
 		Clients.push_back(cl);
 	}
+	if (Clients.size() > 0)
+	{
+		auto b = Clients.size();
+		CurrentClient = Clients[b - 1];
+		printf("Client #%zd is now the default client, change with 'c default <n>' command.\r\n", b);
+		
+	}
 }
 
 
+void Loop()
+{
+	for (;;)
+	{
+		std::string cmd;
+		// Read until enter
+		std::getline(std::cin, cmd);
+
+
+
+		if (cmd == "quit" || cmd == "q")
+			break;
+
+		if (cmd.length() > 2 && cmd.substr(0, 1) == "c")
+		{
+			// Get all parameters in std::vector<string>
+			std::vector<std::string> params;
+			size_t pos = 0;
+			while ((pos = cmd.find(' ')) != std::string::npos)
+			{
+				params.push_back(cmd.substr(0, pos));
+				cmd.erase(0, pos + 1);
+			}
+			params.push_back(cmd);
+			if (params.size() >= 2 && params[1] == "disconnect")
+			{
+				if (CurrentClient)
+				{
+					CurrentClient->qt->ConnectionShutdown(CurrentClient->GetConnections()[0]->hConnection, 
+						QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+				}
+			}
+			if (params.size() >= 3 && params[1] == "default")
+			{
+				int n = atoi(params[2].c_str());
+				if (n > 0)
+					n--;
+				if (n < Clients.size())
+				{
+					CurrentClient = Clients[n];
+					std::cout << "Client #" << n + 1 << " is now the default client." << std::endl;
+				}
+				else
+				{
+					std::cout << "Invalid client number." << std::endl;
+				}
+			}
+		}
+
+		if (cmd.length() > 2 && cmd.substr(0, 1) == "s")
+		{
+			// Get all parameters in std::vector<string>
+			std::vector<std::string> params;
+			size_t pos = 0;
+			while ((pos = cmd.find(' ')) != std::string::npos)
+			{
+				params.push_back(cmd.substr(0, pos));
+				cmd.erase(0, pos + 1);
+			}
+			params.push_back(cmd);
+			if (params.size() >= 3 && params[1] == "default")
+			{
+				int n = atoi(params[2].c_str());
+				if (n > 0)
+					n--;
+				if (n < Servers.size())
+				{
+					CurrentServer = Servers[n];
+					std::cout << "Server #" << n + 1 << " is now the default server." << std::endl;
+				}
+				else
+				{
+					std::cout << "Invalid server number." << std::endl;
+				}
+			}
+		}
+
+
+
+	}
+
+}
