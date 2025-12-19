@@ -205,6 +205,13 @@ public:
 				Event->DATAGRAM_SEND_STATE_CHANGED.State;
 				return QUIC_STATUS_SUCCESS;
 			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED)
+			{
+				std::string msg;
+				msg = Event->DATAGRAM_RECEIVED.Buffer ? std::string((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length) : "";
+				sprintf_s(log, 1000, " Datagram received: %s", msg.c_str());
+				AddLog(S_OK, log);
+			}
 			sprintf_s(log, 1000, " Connection Event: %d", Event->Type);
 			AddLog(S_FALSE, log);
 			return QUIC_STATUS_SUCCESS;
@@ -325,7 +332,23 @@ public:
 		if (FAILED(hr))
 			return hr;
 		AlpnBuffers.Load();
-		hr = qt->ConfigurationOpen(hRegistration,AlpnBuffers.buffers.empty() ? nullptr :  AlpnBuffers.buffers.data(), (uint32_t)AlpnBuffers.buffers.size(), nullptr, 0, this, &hConfiguration);
+
+		QUIC_SETTINGS settings{};
+		settings.IsSet.PeerBidiStreamCount = TRUE;
+		settings.PeerBidiStreamCount = 512;
+
+		settings.IsSet.PeerUnidiStreamCount = TRUE;
+		settings.PeerUnidiStreamCount = 512;
+
+		settings.IsSet.IdleTimeoutMs = TRUE;
+		settings.IdleTimeoutMs = 60000;
+
+		settings.IsSet.DatagramReceiveEnabled = TRUE;
+		settings.DatagramReceiveEnabled = TRUE;
+
+
+
+		hr = qt->ConfigurationOpen(hRegistration,AlpnBuffers.buffers.empty() ? nullptr :  AlpnBuffers.buffers.data(), (uint32_t)AlpnBuffers.buffers.size(), &settings,sizeof(settings), this, &hConfiguration);
 		AddLog(hr, "ConfigurationOpen");
 		if (FAILED(hr))
 			return hr;
