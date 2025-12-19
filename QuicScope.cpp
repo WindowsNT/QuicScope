@@ -1,5 +1,6 @@
 ﻿#include "QuicScope.h"
 std::string Output;
+extern const QUIC_API_TABLE* qt;
 
 int main(int argc,char** argv)
 {
@@ -43,9 +44,13 @@ int main(int argc,char** argv)
 		return 0;
 	}
 
+	
+	MsQuicOpen2(&qt);
+
 	std::cout << std::endl << "Enter help for commands, quit to exit..." << std::endl;
 	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
 	CreateClients(Clients, RegistrationProfile, Alpns);
 	Loop();
+	MsQuicClose(qt);
 	return 0;
 }

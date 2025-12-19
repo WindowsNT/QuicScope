@@ -6,6 +6,8 @@ class QuicClient;
 std::shared_ptr<QuicServer> CurrentServer = nullptr;
 std::shared_ptr<QuicClient> CurrentClient = nullptr;
 
+const QUIC_API_TABLE* qt = 0;
+
 void LuaInit()
 {
 	lua_State* L = luaL_newstate();
@@ -52,7 +54,7 @@ public:
 
 };
 
-nlohmann::json jlog;
+std::shared_ptr<nlohmann::json> jlog = std::make_shared<nlohmann::json>();
 
 
 std::recursive_mutex mtx;
@@ -72,7 +74,7 @@ public:
 		).count();
 		je["hr"] = hr;
 		je["msg"] = msg;
-		jlog["logs"].push_back(je);
+		(*jlog)["logs"].push_back(je);
 
 		// Output to screen
 		if (hr == S_FALSE)
@@ -87,15 +89,15 @@ public:
 	void FinalizeLog()
 	{
 		std::lock_guard<std::recursive_mutex> lock(mtx);
-		if (!jlog.contains("logs"))
+		if (!jlog->contains("logs"))
 			return;
 		if (Output.size() > 0)
 		{
 			std::ofstream ofs(Output, std::ios::out);
-			ofs << jlog.dump(4);
+			ofs << jlog->dump(4);
 			ofs.close();
 
-			jlog = {};
+			jlog = std::make_shared<nlohmann::json>();
 		}
 	}
 
@@ -105,7 +107,6 @@ public:
 class QuicStream: public QuicLog
 {
 public:
-	const QUIC_API_TABLE* qt = 0;
 	HQUIC hConnection = 0;
 	HQUIC hStream = 0;
 
@@ -141,9 +142,18 @@ public:
 class QuicConnection : public QuicLog
 {
 public:
-		const QUIC_API_TABLE* qt = 0;
 		HQUIC hConnection = 0;
 		std::vector<std::shared_ptr<QuicStream>> Streams;
+
+		void WaitHandleClosed()
+		{
+			for (;;)
+			{
+				if (!hConnection)
+					break;
+				Sleep(100);
+			}
+		}
 
 		QUIC_STATUS ConnectionCallback(HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
 		{
@@ -173,12 +183,30 @@ public:
 			}
 			if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED)
 			{
-				sprintf_s(log, 1000, "%p Connection Connected", hConnection);
-				AddLog(S_OK, log);
+				std::string fulllog;
+				sprintf_s(log, 1000, "%p Connection Established", hConnection);
+				fulllog += log;
 				if (Event->CONNECTED.NegotiatedAlpn)
-					sprintf_s(log, 1000, " Alpn: %s", Event->CONNECTED.NegotiatedAlpn);
-				AddLog(S_FALSE, log);
+				{
+					// not null terminated
+					std::string alpn((char*)Event->CONNECTED.NegotiatedAlpn, Event->CONNECTED.NegotiatedAlpnLength);
+					sprintf_s(log, 1000, " Alpn: %s", alpn.c_str());
+					fulllog += log;
+				}
+				AddLog(S_OK,fulllog.c_str());
+				return QUIC_STATUS_SUCCESS;
 			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_IDEAL_PROCESSOR_CHANGED)
+				return QUIC_STATUS_SUCCESS;
+			if (Event->Type == QUIC_CONNECTION_EVENT_PEER_NEEDS_STREAMS)
+				return QUIC_STATUS_SUCCESS;
+			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED)
+			{
+				Event->DATAGRAM_SEND_STATE_CHANGED.State;
+				return QUIC_STATUS_SUCCESS;
+			}
+			sprintf_s(log, 1000, " Connection Event: %d", Event->Type);
+			AddLog(S_FALSE, log);
 			return QUIC_STATUS_SUCCESS;
 		}
 		void SetConnection(HQUIC hConn,bool SetH)
@@ -191,10 +219,14 @@ public:
 		{
 			qt = qqt;
 		}
-		virtual ~QuicConnection()
+		void End()
 		{
 			if (hConnection)
 				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+			WaitHandleClosed();
+		}
+		virtual ~QuicConnection()
+		{
 		}
 };
 
@@ -237,7 +269,7 @@ protected:
 
 		QUIC_CREDENTIAL_CONFIG credConfig = {};
 		credConfig.Type = QUIC_CREDENTIAL_TYPE_NONE;
-		credConfig.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+		credConfig.Flags = QUIC_CREDENTIAL_FLAG_CLIENT | QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
 		auto hr = qt->ConfigurationLoadCredential(hConfiguration, &credConfig);
 		AddLog(hr, "ConfigurationLoadCredential");
 		return hr;
@@ -268,7 +300,6 @@ protected:
 
 public:
 
-	const QUIC_API_TABLE* qt = 0;
 	std::vector<std::shared_ptr<QuicConnection>>& GetConnections() {
 		return Connections;
 	};
@@ -286,14 +317,6 @@ public:
 	virtual HRESULT Begin()
 	{
 		HRESULT hr = 0;
-		if (!qt)
-		{
-			hr = MsQuicOpen2(&qt);
-			AddLog(hr, "QuicOpen2");
-		}
-		if (FAILED(hr))
-			return hr;
-
 		QUIC_REGISTRATION_CONFIG qrc = {};
 		qrc.AppName = "QuicScope";
 		qrc.ExecutionProfile = (QUIC_EXECUTION_PROFILE)rp;
@@ -312,6 +335,8 @@ public:
 	}
 	virtual void End()
 	{
+		for (auto& c : Connections)
+			c->End();
 		Connections.clear();
 		if (hConfiguration)
 		{
@@ -325,12 +350,6 @@ public:
 			AddLog(S_OK, "RegistrationClose");
 			hRegistration = 0;
 		}
-		if (qt)
-		{
-			MsQuicClose(qt);
-			AddLog(S_OK, "QuicClose");
-			qt = 0;
-		}
 		FinalizeLog();
 	}
 };
@@ -340,6 +359,7 @@ class QuicServer : public QuicCommon
 private:
 
 	QUIC_BUFFER_COLLECTION AlpnBuffers;
+	std::shared_ptr<QuicConnection> CurrentConnection = nullptr;
 
 protected:
 
@@ -376,9 +396,10 @@ public:
 			AddLog(S_OK, log);
 			if (evx.Info)
 			{
+				std::string fulllog;
 				auto& info = *evx.Info;
-				sprintf_s(log, " Quic Version: %i", ntohl(info.QuicVersion));
-				AddLog(S_FALSE, log);
+				sprintf_s(log, " Quic Version: %i ", ntohl(info.QuicVersion));
+				fulllog += log;
 				if (info.LocalAddress)
 				{
 					char str_buffer[INET6_ADDRSTRLEN] = { 0 };
@@ -387,8 +408,8 @@ public:
 						(void*)&info.LocalAddress->Ipv4.sin_addr :
 						(void*)&info.LocalAddress->Ipv6.sin6_addr,
 						str_buffer, INET6_ADDRSTRLEN);
-					sprintf_s(log, " Server Address: %s:%d", str_buffer, QuicAddrGetPort(info.LocalAddress));
-					AddLog(S_FALSE, log);
+					sprintf_s(log, " To: %s:%d ", str_buffer, QuicAddrGetPort(info.LocalAddress));
+					fulllog += log;
 				}
 				if (info.RemoteAddress)
 				{
@@ -398,8 +419,8 @@ public:
 						(void*)&info.RemoteAddress->Ipv4.sin_addr :
 						(void*)&info.RemoteAddress->Ipv6.sin6_addr,
 						str_buffer, INET6_ADDRSTRLEN);
-					sprintf_s(log, " Remote Address: %s:%d", str_buffer, QuicAddrGetPort(info.RemoteAddress));
-					AddLog(S_FALSE, log);
+					sprintf_s(log, " From: %s:%d ", str_buffer, QuicAddrGetPort(info.RemoteAddress));
+					fulllog += log;
 				}
 				if (info.ClientAlpnList)
 				{
@@ -414,34 +435,44 @@ public:
 						alpn_list += alpn;
 						offset += alpn_len + 1;
 					}
-					sprintf_s(log, " Client ALPNs: %s", alpn_list.c_str());
-					AddLog(S_FALSE, log);
+					sprintf_s(log, " ALPNs: %s ", alpn_list.c_str());
+					fulllog += log;
 				}
 				if (info.NegotiatedAlpn)
 					{
 					std::string alpn((char*)info.NegotiatedAlpn, info.NegotiatedAlpnLength);
-					sprintf_s(log, " Negotiated ALPN: %s", alpn.c_str());
-					AddLog(S_FALSE, log);
+					sprintf_s(log, " Negotiated ALPN: %s ", alpn.c_str());
+					fulllog += log;
 				}
 				if (info.ServerName)
 				{
 					std::string sname(info.ServerName, info.ServerNameLength);
-					sprintf_s(log, " Server Name: %s", sname.c_str());
-					AddLog(S_FALSE, log);
+					sprintf_s(log, " Server Name: %s ", sname.c_str());
+					fulllog += log;
 				}
+				// remove spaces
+				while (fulllog.size() > 0 && fulllog[fulllog.size() - 1] == ' ')
+					fulllog = fulllog.substr(0, fulllog.size() - 1);
+				AddLog(S_FALSE, fulllog.c_str());
 			}
 
 			auto hr = qt->ConnectionSetConfiguration(NewConnection, hConfiguration);
+			AddLog(hr, "ConnectionSetConfiguration");
 			if (FAILED(hr))
 			{
-				AddLog(hr, "ConnectionSetConfiguration");
 				return hr;
 			}
 			auto conn = std::make_shared<QuicConnection>(qt);
 			conn->SetConnection(NewConnection,true);
 			Connections.push_back(conn);
+			CurrentConnection = conn;
+			std::cout << "Connection #" << Connections.size() << " is now the default connection for this server." << std::endl;
 			return QUIC_STATUS_SUCCESS;
 		}
+
+		sprintf_s(log, 1000, " Listener Event: %d", Event->Type);
+		AddLog(S_FALSE, log);
+
 		return QUIC_STATUS_SUCCESS;
 	}
 	virtual HRESULT Begin() override
@@ -482,6 +513,9 @@ public:
 	}
 	virtual void End() override
 	{
+		for (auto& c : Connections)
+			c->End();
+		Connections.clear();
 		if (hListener6)
 		{
 			qt->ListenerClose(hListener6);
@@ -531,7 +565,7 @@ public:
 		AddLog(hr, "ConnectionOpen");
 		if (!hConnection)
 			return E_FAIL;	
-		connection->SetConnection(hConnection,false);
+		connection->SetConnection(hConnection,true);
 		Connections.push_back(connection);
 		hr = qt->ConnectionStart(hConnection, hConfiguration, strchr(host.c_str(), ':') ? QUIC_ADDRESS_FAMILY_INET6 : QUIC_ADDRESS_FAMILY_INET,
 			host.c_str(), (uint16_t)port);
@@ -615,10 +649,34 @@ void Loop()
 			{
 				if (CurrentClient)
 				{
-					CurrentClient->qt->ConnectionShutdown(CurrentClient->GetConnections()[0]->hConnection, 
+					qt->ConnectionShutdown(CurrentClient->GetConnections()[0]->hConnection, 
 						QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
 				}
 			}
+
+
+			if (params.size() >= 3 && params[1] == "datagram")
+			{
+				// Send datagram on current connection
+				if (CurrentClient)
+				{
+					std::string message; // join all params from index 2
+					for (size_t i = 2; i < params.size(); i++)
+					{
+						if (i > 2)
+							message += " ";
+						message += params[i];
+					}
+					auto conn = CurrentClient->GetConnections()[0];
+					QUIC_BUFFER buffer = {};
+					buffer.Length = (uint32_t)message.size();
+					buffer.Buffer = (uint8_t*)message.data();
+					auto hr = qt->DatagramSend(conn->hConnection, &buffer, 1, QUIC_SEND_FLAG_NONE, nullptr);
+					sprintf_s(conn->log, "Sending datagram: %s", message.c_str());
+					conn->AddLog(hr, conn->log);
+				}
+			}
+
 			if (params.size() >= 3 && params[1] == "default")
 			{
 				int n = atoi(params[2].c_str());
@@ -635,6 +693,8 @@ void Loop()
 				}
 			}
 		}
+
+	
 
 		if (cmd.length() > 2 && cmd.substr(0, 1) == "s")
 		{
@@ -662,10 +722,43 @@ void Loop()
 					std::cout << "Invalid server number." << std::endl;
 				}
 			}
+
+
+			if (params.size() >= 3 && params[1] == "datagram")
+			{
+				// Send datagram on current connection
+				if (CurrentServer)
+				{
+					std::string message; // join all params from index 2
+					for (size_t i = 2; i < params.size(); i++)
+					{
+						if (i > 2)
+							message += " ";
+						message += params[i];
+					}
+					auto conn = CurrentServer->GetConnections()[0];
+					QUIC_BUFFER buffer = {};
+					buffer.Length = (uint32_t)message.size();
+					buffer.Buffer = (uint8_t*)message.data();
+					auto hr = qt->DatagramSend(conn->hConnection, &buffer, 1, QUIC_SEND_FLAG_NONE, nullptr);
+					sprintf_s(conn->log, "Sending datagram: %s", message.c_str());
+					conn->AddLog(hr, conn->log);
+				}
+			}
+
 		}
 
 
 
 	}
+
+	for (auto& c : Clients)
+		c->End();
+	Clients.clear();
+	for (auto& s : Servers)
+		s->End();
+	Servers.clear();
+	CurrentClient = nullptr;
+	CurrentServer = nullptr;
 
 }
