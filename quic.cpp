@@ -1,12 +1,38 @@
  #include "quicscope.h"
 
-extern std::string Output;
+extern std::string OutputFolder;
 class QuicServer;
 class QuicClient;
 std::shared_ptr<QuicServer> CurrentServer = nullptr;
 std::shared_ptr<QuicClient> CurrentClient = nullptr;
 
 const QUIC_API_TABLE* qt = 0;
+
+struct TOT_BUFFER : public QUIC_BUFFER
+{
+	std::vector<uint8_t> data;
+	void Load()
+	{
+		Length = (uint32_t)data.size();
+		Buffer = data.data();
+	}
+	TOT_BUFFER(QUIC_BUFFER* b = 0)
+	{
+		if (!b)
+			return;
+		Length = b->Length;
+		data.resize(Length);
+		memcpy(data.data(), b->Buffer, Length);
+		Buffer = data.data();
+		Load();
+	}
+};
+struct TOT_BUFFERS
+{
+	unsigned long long lp = 0;
+	std::vector<TOT_BUFFER> buffers;
+};
+
 
 void LuaInit()
 {
@@ -62,7 +88,7 @@ class QuicLog
 {
 public:
 
-	char log[1000] = {};
+	char log[2000] = {};
 	void AddLog(HRESULT hr, const char* msg)
 	{
 		if (!msg)
@@ -91,8 +117,11 @@ public:
 		std::lock_guard<std::recursive_mutex> lock(mtx);
 		if (!jlog->contains("logs"))
 			return;
-		if (Output.size() > 0)
+		if (OutputFolder.size() > 0)
 		{
+			auto Output = OutputFolder + "\\log_" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::system_clock::now().time_since_epoch()
+			).count()) + ".json";
 			std::ofstream ofs(Output, std::ios::out);
 			ofs << jlog->dump(4);
 			ofs.close();
@@ -110,7 +139,7 @@ public:
 	HQUIC hConnection = 0;
 	HQUIC hStream = 0;
 
-	QUIC_STATUS StreamCallback(HQUIC Stream, QUIC_STREAM_EVENT* Event)
+	QUIC_STATUS StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREAM_EVENT* Event)
 	{
 		if (!Event)
 			return QUIC_STATUS_INVALID_PARAMETER;
@@ -155,7 +184,7 @@ public:
 			}
 		}
 
-		QUIC_STATUS ConnectionCallback(HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
+		QUIC_STATUS ConnectionCallback([[maybe_unused]] HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
 		{
 			if (!Event)
 				return QUIC_STATUS_INVALID_PARAMETER;
@@ -208,9 +237,24 @@ public:
 			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED)
 			{
 				std::string msg;
+				if (OutputFolder.size())
+				{
+					// Save to datagrams for this connection
+					char filename[1000] = {};
+					sprintf_s(filename, 1000, "%s\\datagram_%p.bin", OutputFolder.c_str(), hConnection);
+					std::ofstream ofs(filename, std::ios::out | std::ios::app | std::ios::binary);
+					ofs.write((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length);
+					ofs.close();
+				}
 				msg = Event->DATAGRAM_RECEIVED.Buffer ? std::string((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length) : "";
-				sprintf_s(log, 1000, " Datagram received: %s", msg.c_str());
-				AddLog(S_OK, log);
+#ifdef _WIN32
+				INT re = 0;
+				if (IsTextUnicode((LPCVOID)msg.c_str(), (int)msg.size(), &re))
+				{
+					sprintf_s(log, 2000, " Datagram received: %s", msg.c_str());
+					AddLog(S_OK, log);
+				}
+#endif
 			}
 			sprintf_s(log, 1000, " Connection Event: %d", Event->Type);
 			AddLog(S_FALSE, log);
@@ -259,8 +303,8 @@ protected:
 			return S_FALSE;
 		}
 		// To be implemented
-#ifdef USE_TURBO_PLAY_CERTIFICATE
-		if (cert_options == "turboplay")
+#ifdef _WIN32
+		if (cert_options == "self")
 		{
 			EnsureDHTP();
 			auto cs = dhtp->RequestCertificate();
@@ -407,10 +451,16 @@ public:
 	{
 		End();
 	}
-	QUIC_STATUS ListenerCallback(HQUIC Listener,QUIC_LISTENER_EVENT* Event)
+	QUIC_STATUS ListenerCallback([[maybe_unused]] HQUIC Listener,QUIC_LISTENER_EVENT* Event)
 	{
 		if (!Event)
 			return QUIC_STATUS_INVALID_PARAMETER;
+		if (Event->Type == QUIC_LISTENER_EVENT_STOP_COMPLETE)
+		{
+			sprintf_s(log, 1000, "Listener Stop Complete");
+			AddLog(S_OK, log);
+			return QUIC_STATUS_SUCCESS;
+		}
 		if (Event->Type == QUIC_LISTENER_EVENT_NEW_CONNECTION)
 		{
 			auto& evx = Event->NEW_CONNECTION;
@@ -625,7 +675,8 @@ void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfil
 	for (auto& c : clnts)
 	{
 		// This is IP,Port
-		auto pos = c.find(',');
+		// Find last colon
+		size_t pos = c.rfind(':');
 		if (pos == std::string::npos)
 			continue;
 		std::string host = c.substr(0, pos);

@@ -1,5 +1,5 @@
 ﻿#include "QuicScope.h"
-std::string Output;
+std::string OutputFolder;
 extern const QUIC_API_TABLE* qt;
 
 int main(int argc,char** argv)
@@ -28,7 +28,7 @@ int main(int argc,char** argv)
 	app.add_option("-s,--server", ServerPorts, "Ports");
 	app.add_option("-f,--forward", Forwards, "Forwards");
 	app.add_option("-c,--client", Clients, "Clients");
-	app.add_option("-o,--output", Output, "Output JSON");
+	app.add_option("-o,--output", OutputFolder, "Output folder");
 	app.add_option("--profile", RegistrationProfile, "Registration Profile");
 	app.add_option("--alpn", Alpns, "Alpn");
 	app.add_option("--cert", cert_options,"Certificate");
@@ -44,10 +44,22 @@ int main(int argc,char** argv)
 		return 0;
 	}
 
+	if (OutputFolder.size() > 0)	
+	{
+		if (OutputFolder.back() != '/' && OutputFolder.back() != '\\')
+		{
+#ifdef _WIN32
+			OutputFolder += "\\";
+#else
+			OutputFolder += "/";
+#endif
+		}
+		std::filesystem::create_directories(OutputFolder);
+	}
+
 	
 	MsQuicOpen2(&qt);
 
-	std::cout << std::endl << "Enter help for commands, quit to exit..." << std::endl;
 	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
 	CreateClients(Clients, RegistrationProfile, Alpns);
 	Loop();
