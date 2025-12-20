@@ -25,10 +25,12 @@ int main(int argc,char** argv)
 	std::vector<std::string> Alpns;
 	std::string cert_options;
 	int RegistrationProfile = 0;
+	int DatagramEnabled = 0;
 	app.add_option("-s,--server", ServerPorts, "Ports");
 	app.add_option("-f,--forward", Forwards, "Forwards");
 	app.add_option("-c,--client", Clients, "Clients");
 	app.add_option("-o,--output", OutputFolder, "Output folder");
+	app.add_option("-d", DatagramEnabled, "Datagrams Enabled");
 	app.add_option("--profile", RegistrationProfile, "Registration Profile");
 	app.add_option("--alpn", Alpns, "Alpn");
 	app.add_option("--cert", cert_options,"Certificate");
@@ -59,9 +61,16 @@ int main(int argc,char** argv)
 
 	
 	MsQuicOpen2(&qt);
+	
+	SETTINGS set;
+	set.Alpns = Alpns;
+	set.RegistrationProfile = RegistrationProfile;
+	set.cert_options = cert_options;
+	set.DatagramsEnabled = DatagramEnabled;
 
-	CreateServers(ServerPorts,RegistrationProfile,Alpns, cert_options);
-	CreateClients(Clients, RegistrationProfile, Alpns);
+
+	CreateServers(ServerPorts,set);
+	CreateClients(Clients, set);
 	Loop();
 	MsQuicClose(qt);
 	return 0;

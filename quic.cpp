@@ -293,6 +293,7 @@ protected:
 	int rp = 0;
 	HQUIC hRegistration = 0;
 	HQUIC hConfiguration = 0;
+	bool UseDatagram = 0;
 	std::vector<std::shared_ptr<QuicConnection>> Connections;
 
 	HRESULT LoadCertificate(std::string cert_options)
@@ -355,10 +356,11 @@ public:
 		return Connections;
 	};
 
-	QuicCommon(int RegistrationProfile, std::vector<std::string> alpns)
+	QuicCommon(SETTINGS& s)
 	{
-		rp = RegistrationProfile;
-		LoadAlpns(alpns, AlpnBuffers);
+		rp = s.RegistrationProfile;
+		UseDatagram = s.DatagramsEnabled != 0;
+		LoadAlpns(s.Alpns, AlpnBuffers);
 	}
 	virtual ~QuicCommon()
 	{
@@ -388,9 +390,7 @@ public:
 		settings.IdleTimeoutMs = 60000;
 
 		settings.IsSet.DatagramReceiveEnabled = TRUE;
-		settings.DatagramReceiveEnabled = TRUE;
-
-
+		settings.DatagramReceiveEnabled = UseDatagram;
 
 		hr = qt->ConfigurationOpen(hRegistration,AlpnBuffers.buffers.empty() ? nullptr :  AlpnBuffers.buffers.data(), (uint32_t)AlpnBuffers.buffers.size(), &settings,sizeof(settings), this, &hConfiguration);
 		AddLog(hr, "ConfigurationOpen");
@@ -437,10 +437,10 @@ protected:
 	HQUIC hListener6 = 0;
 
 public:
-	QuicServer(int liport, int Ip46,int RegistrationProfile, std::vector<std::string> alpns,std::string cert_options) : QuicCommon(RegistrationProfile,alpns)
+	QuicServer(int liport, int Ip46,SETTINGS& s) : QuicCommon(s)
 	{
-		LoadAlpns(alpns, AlpnBuffers);
-		LoadCertificate(cert_options);
+		LoadAlpns(s.Alpns, AlpnBuffers);
+		LoadCertificate(s.cert_options);
 		ListenPort = liport;
 		if (Ip46 == 1 || Ip46 == 2)
 			Use4 = true;
@@ -575,6 +575,7 @@ public:
 		{
 			QUIC_ADDR LocalAddress = {};
 			QuicAddrSetFamily(&LocalAddress, listener == hListener6 ? QUIC_ADDRESS_FAMILY_INET6 : QUIC_ADDRESS_FAMILY_INET);
+//			QuicAddrSetFamily(&LocalAddress, QUIC_ADDRESS_FAMILY_UNSPEC);
 			QuicAddrSetPort(&LocalAddress,(uint16_t) ListenPort);
 
 			AlpnBuffers.Load();
@@ -608,7 +609,7 @@ class QuicClient : public QuicCommon
 	std::string host;
 	int port = 0;
 public:
-	QuicClient(std::string _host,int _port,int RegistrationProfile, std::vector<std::string> Alpns) : QuicCommon(RegistrationProfile,Alpns)
+	QuicClient(std::string _host,int _port, SETTINGS& s) : QuicCommon(s)
 	{
 		host = _host;
 		port = _port;
@@ -652,11 +653,11 @@ public:
 std::vector<std::shared_ptr<QuicServer>> Servers;
 std::vector<std::shared_ptr<QuicClient>> Clients;
 
-void CreateServers(const std::vector<int>& ports,int RegistrationProfile, std::vector<std::string> Alpns, std::string cert_options)
+void CreateServers(const std::vector<int>& ports, SETTINGS& settings)
 {
 	for (auto p : ports)
 	{
-		auto s = std::make_shared<QuicServer>(p, 2,RegistrationProfile,Alpns,cert_options);
+		auto s = std::make_shared<QuicServer>(p, 2,settings);
 		s->Begin();
 		Servers.push_back(s);
 	}
@@ -670,7 +671,7 @@ void CreateServers(const std::vector<int>& ports,int RegistrationProfile, std::v
 }
 
 
-void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfile, std::vector<std::string> Alpns)
+void CreateClients(const std::vector<std::string>& clnts , SETTINGS& settings)
 {
 	for (auto& c : clnts)
 	{
@@ -681,7 +682,7 @@ void CreateClients(const std::vector<std::string>& clnts, int RegistrationProfil
 			continue;
 		std::string host = c.substr(0, pos);
 		int port = atoi(c.substr(pos + 1).c_str());
-		auto cl = std::make_shared<QuicClient>(host, port, RegistrationProfile, Alpns);
+		auto cl = std::make_shared<QuicClient>(host, port, settings);
 		cl->Begin();
 		Clients.push_back(cl);
 	}
