@@ -48,4 +48,6 @@ struct SETTINGS
 
 void CreateServers(const std::vector<int>& ports,SETTINGS& s);
 void CreateClients(const std::vector<std::string>& clnts, SETTINGS& s);
+void CreateForwards(const std::vector<std::string>& forwarder, SETTINGS& settings);
+
 void Loop();

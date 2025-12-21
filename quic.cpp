@@ -3,8 +3,40 @@
 extern std::string OutputFolder;
 class QuicServer;
 class QuicClient;
-std::shared_ptr<QuicServer> CurrentServer = nullptr;
-std::shared_ptr<QuicClient> CurrentClient = nullptr;
+class QuicForward;
+
+
+bool is_printable_or_utf8(const char* buf, size_t len) {
+	size_t i = 0;
+	while (i < len) {
+		unsigned char c = buf[i];
+
+		// ASCII printable + whitespace
+		if ((c >= 32 && c <= 126) || c == '\n' || c == '\r' || c == '\t') {
+			++i;
+			continue;
+		}
+
+		// UTF-8 multi-byte sequences
+		size_t remaining = len - i;
+		if ((c & 0xE0) == 0xC0 && remaining >= 2) {       // 2-byte
+			if ((buf[i + 1] & 0xC0) != 0x80) return false;
+			i += 2;
+		}
+		else if ((c & 0xF0) == 0xE0 && remaining >= 3) { // 3-byte
+			if ((buf[i + 1] & 0xC0) != 0x80 || (buf[i + 2] & 0xC0) != 0x80) return false;
+			i += 3;
+		}
+		else if ((c & 0xF8) == 0xF0 && remaining >= 4) { // 4-byte
+			if ((buf[i + 1] & 0xC0) != 0x80 || (buf[i + 2] & 0xC0) != 0x80 || (buf[i + 3] & 0xC0) != 0x80) return false;
+			i += 4;
+		}
+		else {
+			return false; // invalid UTF-8
+		}
+	}
+	return true;
+}
 
 const QUIC_API_TABLE* qt = 0;
 
@@ -231,7 +263,22 @@ public:
 				return QUIC_STATUS_SUCCESS;
 			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED)
 			{
+				return QUIC_STATUS_SUCCESS;
+			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE)
+			{
+				auto& r = Event->STREAMS_AVAILABLE;
+				sprintf_s(log, 1000, " Streams Available - Bi: %d Uni: %d", r.BidirectionalCount, r.UnidirectionalCount);
+				AddLog(S_FALSE, log);
+				return QUIC_STATUS_SUCCESS;
+			}
+			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED)
+			{
 				Event->DATAGRAM_SEND_STATE_CHANGED.State;
+				auto& recv = Event->DATAGRAM_SEND_STATE_CHANGED;
+				TOT_BUFFERS* buf = (TOT_BUFFERS*)recv.ClientContext;
+				if (buf && recv.State == QUIC_DATAGRAM_SEND_SENT)
+					delete buf;
 				return QUIC_STATUS_SUCCESS;
 			}
 			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED)
@@ -247,14 +294,12 @@ public:
 					ofs.close();
 				}
 				msg = Event->DATAGRAM_RECEIVED.Buffer ? std::string((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length) : "";
-#ifdef _WIN32
-				INT re = 0;
-				if (IsTextUnicode((LPCVOID)msg.c_str(), (int)msg.size(), &re))
+				if (is_printable_or_utf8(msg.c_str(), (int)msg.size()))
 				{
-					sprintf_s(log, 2000, " Datagram received: %s", msg.c_str());
+					sprintf_s(log, 2000, "Datagram received: %s", msg.c_str());
 					AddLog(S_OK, log);
 				}
-#endif
+				return QUIC_STATUS_SUCCESS;
 			}
 			sprintf_s(log, 1000, " Connection Event: %d", Event->Type);
 			AddLog(S_FALSE, log);
@@ -426,7 +471,6 @@ class QuicServer : public QuicCommon
 private:
 
 	QUIC_BUFFER_COLLECTION AlpnBuffers;
-	std::shared_ptr<QuicConnection> CurrentConnection = nullptr;
 
 protected:
 
@@ -538,8 +582,6 @@ public:
 			auto conn = std::make_shared<QuicConnection>(qt);
 			conn->SetConnection(NewConnection,true);
 			Connections.push_back(conn);
-			CurrentConnection = conn;
-			std::cout << "Connection #" << Connections.size() << " is now the default connection for this server." << std::endl;
 			return QUIC_STATUS_SUCCESS;
 		}
 
@@ -650,8 +692,20 @@ public:
 };
 
 
+class QuicForward : public QuicServer, public QuicClient
+{
+public:
+
+	QuicForward(int liport, int Ip46, SETTINGS& s, std::string targethost, int targetport)
+		: QuicServer(liport, Ip46, s), QuicClient(targethost, targetport, s)
+	{
+	}
+};
+
+
 std::vector<std::shared_ptr<QuicServer>> Servers;
 std::vector<std::shared_ptr<QuicClient>> Clients;
+std::vector<std::shared_ptr<QuicForward>> Forwards;
 
 void CreateServers(const std::vector<int>& ports, SETTINGS& settings)
 {
@@ -661,12 +715,28 @@ void CreateServers(const std::vector<int>& ports, SETTINGS& settings)
 		s->Begin();
 		Servers.push_back(s);
 	}
-	if (Servers.size() > 0)
-	{
-		auto b = Servers.size();
-		CurrentServer = Servers[b - 1];
-		printf("Server #%zd is now the default server, change with 's default <n>' command.\r\n", b);
+}
 
+
+void CreateForwards(const std::vector<std::string>& forwarder, SETTINGS& settings)
+{
+	for (auto p : forwarder)
+	{
+		// This is ListenPort,TargetIP:TargetPort
+		size_t pos = p.find(',');
+		if (pos == std::string::npos)
+			continue;
+		int listenport = atoi(p.substr(0, pos).c_str());
+		std::string target = p.substr(pos + 1);
+		// Find last colon
+		size_t pos2 = target.rfind(':');
+		if (pos2 == std::string::npos)
+			continue;
+		std::string targethost = target.substr(0, pos2);
+		int targetport = atoi(target.substr(pos2 + 1).c_str());
+		auto fwd = std::make_shared<QuicForward>(listenport, 2, settings, targethost, targetport);
+//		fwd->Begin();
+		Forwards.push_back(fwd);
 	}
 }
 
@@ -686,13 +756,6 @@ void CreateClients(const std::vector<std::string>& clnts , SETTINGS& settings)
 		cl->Begin();
 		Clients.push_back(cl);
 	}
-	if (Clients.size() > 0)
-	{
-		auto b = Clients.size();
-		CurrentClient = Clients[b - 1];
-		printf("Client #%zd is now the default client, change with 'c default <n>' command.\r\n", b);
-		
-	}
 }
 
 
@@ -701,130 +764,95 @@ void Loop()
 	for (;;)
 	{
 		std::string cmd;
+		
 		// Read until enter
 		std::getline(std::cin, cmd);
-
-
 
 		if (cmd == "quit" || cmd == "q")
 			break;
 
-		if (cmd.length() > 2 && cmd.substr(0, 1) == "c")
+		int WhatServer = -1;
+		int WhatClient = -1;
+		int WhatConnection = -1;
+		std::string rest;
+		std::string command;
+		CLI::App app{ "QuicScopeCommand" };
+#ifdef _WIN32
+		app.allow_windows_style_options(true);
+#endif
+		app.add_option("command", command, "The initial command")->required();
+		app.add_option("-s,--server", WhatServer);
+		app.add_option("-c,--client", WhatClient);
+		app.add_option("-e,--connection", WhatConnection);
+		app.add_option("rest", rest, "Remaining arguments")
+			->expected(-1);
+		try
 		{
-			// Get all parameters in std::vector<string>
-			std::vector<std::string> params;
-			size_t pos = 0;
-			while ((pos = cmd.find(' ')) != std::string::npos)
-			{
-				params.push_back(cmd.substr(0, pos));
-				cmd.erase(0, pos + 1);
-			}
-			params.push_back(cmd);
-			if (params.size() >= 2 && params[1] == "disconnect")
-			{
-				if (CurrentClient)
-				{
-					qt->ConnectionShutdown(CurrentClient->GetConnections()[0]->hConnection, 
-						QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-				}
-			}
-
-
-			if (params.size() >= 3 && params[1] == "datagram")
-			{
-				// Send datagram on current connection
-				if (CurrentClient)
-				{
-					std::string message; // join all params from index 2
-					for (size_t i = 2; i < params.size(); i++)
-					{
-						if (i > 2)
-							message += " ";
-						message += params[i];
-					}
-					auto conn = CurrentClient->GetConnections()[0];
-					QUIC_BUFFER buffer = {};
-					buffer.Length = (uint32_t)message.size();
-					buffer.Buffer = (uint8_t*)message.data();
-					auto hr = qt->DatagramSend(conn->hConnection, &buffer, 1, QUIC_SEND_FLAG_NONE, nullptr);
-					sprintf_s(conn->log, "Sending datagram: %s", message.c_str());
-					conn->AddLog(hr, conn->log);
-				}
-			}
-
-			if (params.size() >= 3 && params[1] == "default")
-			{
-				int n = atoi(params[2].c_str());
-				if (n > 0)
-					n--;
-				if (n < Clients.size())
-				{
-					CurrentClient = Clients[n];
-					std::cout << "Client #" << n + 1 << " is now the default client." << std::endl;
-				}
-				else
-				{
-					std::cout << "Invalid client number." << std::endl;
-				}
-			}
+			app.parse(cmd);
 		}
-
+		catch (const CLI::ParseError& e)
+		{
+			std::cout << e.what();
+			std::cout << std::endl;
+			continue;
+		}
 	
 
-		if (cmd.length() > 2 && cmd.substr(0, 1) == "s")
+		if (command == "datagram")
 		{
-			// Get all parameters in std::vector<string>
-			std::vector<std::string> params;
-			size_t pos = 0;
-			while ((pos = cmd.find(' ')) != std::string::npos)
+			QuicConnection* wc = 0;
+			if (WhatServer >= 0 && WhatServer < Servers.size())
 			{
-				params.push_back(cmd.substr(0, pos));
-				cmd.erase(0, pos + 1);
-			}
-			params.push_back(cmd);
-			if (params.size() >= 3 && params[1] == "default")
-			{
-				int n = atoi(params[2].c_str());
-				if (n > 0)
-					n--;
-				if (n < Servers.size())
+				if (WhatConnection >= 0 && WhatConnection < Servers[WhatServer]->GetConnections().size())
 				{
-					CurrentServer = Servers[n];
-					std::cout << "Server #" << n + 1 << " is now the default server." << std::endl;
+					wc = Servers[WhatServer]->GetConnections()[WhatConnection].get();
+				}
+				if (WhatConnection == -1 && Servers[WhatServer]->GetConnections().size() > 0)
+				{
+					wc = Servers[WhatServer]->GetConnections()[0].get();
+				}
+			}
+			if (WhatClient >= 0 && WhatClient < Clients.size())
+			{
+				if (WhatConnection >= 0 && WhatConnection < Clients[WhatClient]->GetConnections().size())
+				{
+					wc = Clients[WhatClient]->GetConnections()[WhatConnection].get();
+				}
+				if (WhatConnection == -1 && Clients[WhatClient]->GetConnections().size() > 0)
+				{
+					wc = Clients[WhatClient]->GetConnections()[0].get();
+				}
+			}
+			if (!wc)
+			{
+				if (Servers.size() > 0 && Servers[0]->GetConnections().size() > 0)
+				{
+					wc = Servers[0]->GetConnections()[0].get();
 				}
 				else
+				if (Clients.size() > 0 && Clients[0]->GetConnections().size() > 0)
 				{
-					std::cout << "Invalid server number." << std::endl;
+					wc = Clients[0]->GetConnections()[0].get();
 				}
 			}
-
-
-			if (params.size() >= 3 && params[1] == "datagram")
+			if (wc)
 			{
-				// Send datagram on current connection
-				if (CurrentServer)
-				{
-					std::string message; // join all params from index 2
-					for (size_t i = 2; i < params.size(); i++)
-					{
-						if (i > 2)
-							message += " ";
-						message += params[i];
-					}
-					auto conn = CurrentServer->GetConnections()[0];
-					QUIC_BUFFER buffer = {};
-					buffer.Length = (uint32_t)message.size();
-					buffer.Buffer = (uint8_t*)message.data();
-					auto hr = qt->DatagramSend(conn->hConnection, &buffer, 1, QUIC_SEND_FLAG_NONE, nullptr);
-					sprintf_s(conn->log, "Sending datagram: %s", message.c_str());
-					conn->AddLog(hr, conn->log);
-				}
+				QUIC_BUFFER buffer = {};
+				TOT_BUFFERS* tbuffers = new TOT_BUFFERS();
+				tbuffers->buffers.resize(1);
+				tbuffers->buffers[0].data.resize(rest.size());
+				memcpy(tbuffers->buffers[0].data.data(), rest.data(), rest.size());
+				tbuffers->buffers[0].Load();
+				auto hr = qt->DatagramSend(wc->hConnection,tbuffers->buffers.data(), 1, QUIC_SEND_FLAG_NONE, tbuffers);
+				sprintf_s(wc->log, "Sending datagram: %s", rest.c_str());
+				wc->AddLog(hr, wc->log);
+			}
+			else
+			{
+				std::cout << "Invalid server/client/connection selection." << std::endl;
 			}
 
 		}
-
-
-
 	}
 
 	for (auto& c : Clients)
@@ -833,7 +861,5 @@ void Loop()
 	for (auto& s : Servers)
 		s->End();
 	Servers.clear();
-	CurrentClient = nullptr;
-	CurrentServer = nullptr;
 
 }

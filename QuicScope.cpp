@@ -71,6 +71,7 @@ int main(int argc,char** argv)
 
 	CreateServers(ServerPorts,set);
 	CreateClients(Clients, set);
+	CreateForwards(Forwards, set);
 	Loop();
 	MsQuicClose(qt);
 	return 0;
