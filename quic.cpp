@@ -5,6 +5,9 @@ class QuicServer;
 class QuicClient;
 class QuicForward;
 
+#pragma warning(disable:4100)
+#pragma warning(disable:4189)
+
 
 bool is_printable_or_utf8(const char* buf, size_t len) {
 	size_t i = 0;
@@ -170,11 +173,20 @@ class QuicStream: public QuicLog
 public:
 	HQUIC hConnection = 0;
 	HQUIC hStream = 0;
+	uint64_t StreamID = 0;
 
 	QUIC_STATUS StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREAM_EVENT* Event)
 	{
 		if (!Event)
 			return QUIC_STATUS_INVALID_PARAMETER;
+		if (Event->Type == QUIC_STREAM_EVENT_START_COMPLETE)
+		{
+			StreamID = Event->START_COMPLETE.ID;
+			sprintf_s(log, 1000, "%p Stream Start Complete ID=%llu", hStream, StreamID);
+			AddLog(S_OK, log);
+			return QUIC_STATUS_SUCCESS;
+		}
+
 		if (Event->Type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
 		{
 			sprintf_s(log, 1000, "%p Stream Shutdown Complete", hStream);
@@ -183,6 +195,24 @@ public:
 			hStream = 0;
 			return QUIC_STATUS_SUCCESS;
 		}
+		if (Event->Type == QUIC_STREAM_EVENT_SEND_COMPLETE)
+		{
+			TOT_BUFFERS* tot = (TOT_BUFFERS*)Event->SEND_COMPLETE.ClientContext;
+			auto total_bytes_size = 0;
+			for (auto& t : tot->buffers)
+				total_bytes_size += t.Length;
+//			int rv = nghttp3_conn_add_ack_offset(s->Http3, id, total_bytes_size);
+			delete tot;
+	//		if (rv != 0) {
+		//		s->qt->ConnectionClose(s->Connection);
+		//		return QUIC_STATUS_INTERNAL_ERROR;
+			//}
+
+			// Go again
+//			return s->FlushX();
+		}
+		sprintf_s(log, 1000, "%p Stream Event: %d", hStream, Event->Type);
+		AddLog(S_OK, log);
 		return QUIC_STATUS_SUCCESS;
 	}
 	QuicStream(const QUIC_API_TABLE* qqt, HQUIC hConn,HQUIC hStrm)
@@ -200,11 +230,21 @@ public:
 };
 
 
+struct A_HEADER
+{
+	std::string hname;
+	std::string hvalue;
+};
+
 class QuicConnection : public QuicLog
 {
 public:
 		HQUIC hConnection = 0;
 		std::vector<std::shared_ptr<QuicStream>> Streams;
+
+		nghttp3_conn* Http3 = 0;
+		std::vector<A_HEADER> A_Request;
+
 
 		void WaitHandleClosed()
 		{
@@ -214,6 +254,173 @@ public:
 					break;
 				Sleep(100);
 			}
+		}
+
+		int OnHeadersReceived2(nghttp3_conn* conn, int64_t stream_id,
+			int32_t token, nghttp3_rcbuf* name,
+			nghttp3_rcbuf* value, uint8_t flags,
+			void* stream_user_data)
+		{
+			auto n = nghttp3_rcbuf_get_buf(name);
+			auto v = nghttp3_rcbuf_get_buf(value);
+			std::string hname((const char*)n.base, n.len);
+			std::string hvalue((const char*)v.base, v.len);
+
+			// Submit headers to your application logic here
+			A_HEADER ah;
+			ah.hname = hname;
+			ah.hvalue = hvalue;
+			A_Request.push_back(ah);
+			return 0;
+		}
+
+
+		bool Http3Connected = 0;
+
+
+		int Send200(int64_t stream_id, bool fin)
+		{
+			nghttp3_nv resp[] = {
+		{(uint8_t*)":status", (uint8_t*)"200", 7, 3, NGHTTP3_NV_FLAG_NONE}
+			};
+			int rv = fin ? nghttp3_conn_submit_response(Http3, stream_id, resp, 1, nullptr) : nghttp3_conn_submit_info(Http3, stream_id, resp, 1);
+			FlushX();
+			Http3Connected = 1;
+			return rv;
+		}
+
+
+
+		QUIC_STATUS InitializeHttp3()
+		{
+			nghttp3_callbacks callbacks = {};
+			callbacks.recv_header = [](nghttp3_conn* conn, int64_t stream_id,
+				int32_t token, nghttp3_rcbuf* name,
+				nghttp3_rcbuf* value, uint8_t flags,
+				void* conn_user_data,
+				void* stream_user_data)
+				{
+					QuicConnection* session = (QuicConnection*)conn_user_data;
+					return session->OnHeadersReceived2(conn, stream_id, token, name, value, flags, stream_user_data);
+				};
+			callbacks.recv_data = [](nghttp3_conn* conn, int64_t stream_id,
+				const uint8_t* data, size_t datalen,
+				void* conn_user_data, void* stream_user_data) ->int
+				{
+					return 0;
+				};
+			callbacks.recv_settings = [](nghttp3_conn* conn,
+				const nghttp3_settings* settings,
+				void* conn_user_data)
+				{
+					if (!conn || !settings || !conn_user_data)
+						return -5;
+					QuicConnection* session = (QuicConnection*)conn_user_data;
+					return 0;
+				};
+			callbacks.begin_headers = [](nghttp3_conn* conn, int64_t stream_id,
+				void* conn_user_data,
+				void* stream_user_data)
+				{
+					QuicConnection* session = (QuicConnection*)conn_user_data;
+					session->A_Request.clear();
+					return 0;
+				};
+			callbacks.end_headers = [](nghttp3_conn* conn, int64_t stream_id,
+				int fin, void* conn_user_data,
+				void* stream_user_data)
+				{
+					QuicConnection* session = (QuicConnection*)conn_user_data;
+					session->Send200(stream_id, 0);
+					return 0;
+				};
+
+			nghttp3_settings settings = {};
+			nghttp3_settings_default(&settings);
+			settings.enable_connect_protocol = 1;
+			settings.h3_datagram = 1;
+			settings.qpack_blocked_streams = 100;
+			settings.max_field_section_size = 65536;
+			settings.enable_web_transport = 1;
+			settings.enable_webtransport_datagrams = 1;
+
+			int rv = nghttp3_conn_server_new(&Http3, &callbacks, &settings, 0, (void*)this);
+			if (rv != 0)
+				return QUIC_STATUS_INTERNAL_ERROR;
+
+			return QUIC_STATUS_SUCCESS;
+		}
+
+
+		QUIC_STATUS FlushX()
+		{
+			for (;;)
+			{
+				nghttp3_vec vec[16] = {};
+				nghttp3_ssize nvecs_produced = 0;
+
+				int64_t stream_id = 0;
+				int fin = 0;
+				auto rv = nghttp3_conn_writev_stream(Http3, &stream_id, &fin, vec, 16);
+				nvecs_produced = rv;
+				if (rv < 0)
+					return QUIC_STATUS_INTERNAL_ERROR;
+
+				if (stream_id < 0)
+					break;
+
+				HQUIC h = 0;
+				for (auto& strm : Streams)
+				{
+					if (strm->StreamID == (uint64_t)stream_id)
+					{
+						h = strm->hStream;
+						break;
+					}
+				}
+
+				if (h == 0 && nvecs_produced > 0)
+					return QUIC_STATUS_INTERNAL_ERROR;
+
+				size_t tot_sent = 0;
+				if (nvecs_produced > 0) {
+
+					TOT_BUFFERS* tot = new TOT_BUFFERS();
+					for (int i = 0; i < nvecs_produced; ++i) {
+						TOT_BUFFER  b;
+						b.data.resize(vec[i].len);
+						memcpy(b.data.data(), vec[i].base, vec[i].len);
+						tot->buffers.emplace_back(b);
+						tot_sent += vec[i].len;
+					}
+					for (auto& t : tot->buffers)
+						t.Load();
+
+					auto flags = QUIC_SEND_FLAG_NONE;
+					if (fin)
+						flags |= QUIC_SEND_FLAG_FIN;
+					auto qs = qt->StreamSend(
+						h,
+						tot->buffers.data(),
+						(uint32_t)tot->buffers.size(),
+						flags,
+						(void*)tot
+					);
+					if (QUIC_FAILED(qs))
+						return QUIC_STATUS_INTERNAL_ERROR;
+				}
+
+
+				if (stream_id >= 0 && (tot_sent || fin))
+				{
+					rv = nghttp3_conn_add_write_offset(Http3, stream_id, tot_sent);
+					if (rv != 0)
+						return QUIC_STATUS_INTERNAL_ERROR;
+				}
+				if (stream_id < 0)
+					break;
+			}
+			return QUIC_STATUS_SUCCESS;
 		}
 
 		QUIC_STATUS ConnectionCallback([[maybe_unused]] HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
@@ -226,7 +433,37 @@ public:
 				sprintf_s(log, 1000, "%p Peer Stream Started", Stream);
 				AddLog(S_OK, log);
 				auto str = std::make_shared<QuicStream>(qt, hConnection, Stream);
+				// Get the ID
+				int64_t stream_id = 0;
+				uint32_t bl = 8;
+				qt->GetParam(
+					Stream,
+					QUIC_PARAM_STREAM_ID,
+					&bl,
+					&stream_id
+				);
+				str->StreamID = stream_id;
 				Streams.push_back(str);
+
+				bool IsUnidirectional = Event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL;
+
+				// enable auto-delivery
+				auto qs = qt->StreamReceiveSetEnabled(Stream, TRUE);
+
+				qt->SetCallbackHandler(
+					Stream,
+					[](_In_ HQUIC Stream, _In_opt_ void* Context, _Inout_ QUIC_STREAM_EVENT* Event)
+					{
+						QuicStream* session = (QuicStream*)Context;
+						if (session == 0)
+							return QUIC_STATUS_INVALID_STATE;
+						return session->StreamCallback(Stream, Event);
+					},
+					str.get()
+				);
+
+
+				return QUIC_STATUS_SUCCESS;
 			}
 			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
 			{
@@ -317,6 +554,10 @@ public:
 		}
 		void End()
 		{
+			if (Http3) {
+				nghttp3_conn_del(Http3);
+				Http3 = nullptr;
+			}
 			if (hConnection)
 				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
 			WaitHandleClosed();
@@ -411,6 +652,7 @@ public:
 	{
 		End();
 	}
+
 
 	virtual HRESULT Begin()
 	{
@@ -774,6 +1016,7 @@ void Loop()
 		int WhatServer = -1;
 		int WhatClient = -1;
 		int WhatConnection = -1;
+		int WhatStream = -1;
 		std::string rest;
 		std::string command;
 		CLI::App app{ "QuicScopeCommand" };
@@ -784,6 +1027,7 @@ void Loop()
 		app.add_option("-s,--server", WhatServer);
 		app.add_option("-c,--client", WhatClient);
 		app.add_option("-e,--connection", WhatConnection);
+		app.add_option("-r,--stream", WhatStream);
 		app.add_option("rest", rest, "Remaining arguments")
 			->expected(-1);
 		try
@@ -796,45 +1040,81 @@ void Loop()
 			std::cout << std::endl;
 			continue;
 		}
-	
+
+		QuicConnection* wc = 0;
+		QuicStream* ws = 0;
+		if (WhatServer >= 0 && WhatServer < Servers.size())
+		{
+			if (WhatConnection >= 0 && WhatConnection < Servers[WhatServer]->GetConnections().size())
+			{
+				wc = Servers[WhatServer]->GetConnections()[WhatConnection].get();
+			}
+			if (WhatConnection == -1 && Servers[WhatServer]->GetConnections().size() > 0)
+			{
+				wc = Servers[WhatServer]->GetConnections()[0].get();
+			}
+		}
+		if (WhatClient >= 0 && WhatClient < Clients.size())
+		{
+			if (WhatConnection >= 0 && WhatConnection < Clients[WhatClient]->GetConnections().size())
+			{
+				wc = Clients[WhatClient]->GetConnections()[WhatConnection].get();
+			}
+			if (WhatConnection == -1 && Clients[WhatClient]->GetConnections().size() > 0)
+			{
+				wc = Clients[WhatClient]->GetConnections()[0].get();
+			}
+		}
+		if (!wc)
+		{
+			if (Servers.size() > 0 && Servers[0]->GetConnections().size() > 0)
+			{
+				wc = Servers[0]->GetConnections()[0].get();
+			}
+			else
+			if (Clients.size() > 0 && Clients[0]->GetConnections().size() > 0)
+			{
+				wc = Clients[0]->GetConnections()[0].get();
+			}
+		}
+
+		if (wc)
+		{
+			if (WhatStream >= 0 && WhatStream < wc->Streams.size())
+			{
+				ws = wc->Streams[WhatStream].get();
+			}
+			if (WhatStream == -1 && wc->Streams.size() > 0)
+			{
+				ws = wc->Streams[0].get();
+			}
+		}
+
+		if (command == "start")
+		{
+			if (wc)
+			{
+				auto str = std::make_shared<QuicStream>(qt, wc->hConnection, nullptr);
+				wc->Streams.push_back(str);
+				auto hr = qt->StreamOpen(wc->hConnection, QUIC_STREAM_OPEN_FLAG_NONE, [](_In_ HQUIC Stream, _In_opt_ void* Context, _Inout_ QUIC_STREAM_EVENT* Event)
+					{
+						QuicStream* session = (QuicStream*)Context;
+						if (session == 0)
+							return QUIC_STATUS_INVALID_STATE;
+						return session->StreamCallback(Stream, Event);
+
+					}, str.get(), &str->hStream);
+				str->AddLog(hr, "StreamOpen");
+				if (FAILED(hr))
+					continue;
+				hr = qt->StreamStart(str->hStream, QUIC_STREAM_START_FLAG_NONE);
+				sprintf_s(str->log, "Starting stream on connection %p", wc->hConnection);
+				str->AddLog(hr, str->log);
+			}
+		}
 
 		if (command == "datagram")
 		{
-			QuicConnection* wc = 0;
-			if (WhatServer >= 0 && WhatServer < Servers.size())
-			{
-				if (WhatConnection >= 0 && WhatConnection < Servers[WhatServer]->GetConnections().size())
-				{
-					wc = Servers[WhatServer]->GetConnections()[WhatConnection].get();
-				}
-				if (WhatConnection == -1 && Servers[WhatServer]->GetConnections().size() > 0)
-				{
-					wc = Servers[WhatServer]->GetConnections()[0].get();
-				}
-			}
-			if (WhatClient >= 0 && WhatClient < Clients.size())
-			{
-				if (WhatConnection >= 0 && WhatConnection < Clients[WhatClient]->GetConnections().size())
-				{
-					wc = Clients[WhatClient]->GetConnections()[WhatConnection].get();
-				}
-				if (WhatConnection == -1 && Clients[WhatClient]->GetConnections().size() > 0)
-				{
-					wc = Clients[WhatClient]->GetConnections()[0].get();
-				}
-			}
-			if (!wc)
-			{
-				if (Servers.size() > 0 && Servers[0]->GetConnections().size() > 0)
-				{
-					wc = Servers[0]->GetConnections()[0].get();
-				}
-				else
-				if (Clients.size() > 0 && Clients[0]->GetConnections().size() > 0)
-				{
-					wc = Clients[0]->GetConnections()[0].get();
-				}
-			}
 			if (wc)
 			{
 				QUIC_BUFFER buffer = {};
@@ -851,7 +1131,22 @@ void Loop()
 			{
 				std::cout << "Invalid server/client/connection selection." << std::endl;
 			}
+		}
 
+		if (command == "stream")
+		{
+			if (ws)
+			{
+				QUIC_BUFFER buffer = {};
+				TOT_BUFFERS* tbuffers = new TOT_BUFFERS();
+				tbuffers->buffers.resize(1);
+				tbuffers->buffers[0].data.resize(rest.size());
+				memcpy(tbuffers->buffers[0].data.data(), rest.data(), rest.size());
+				tbuffers->buffers[0].Load();
+				auto hr = qt->StreamSend(ws->hStream, tbuffers->buffers.data(), 1, QUIC_SEND_FLAG_NONE, tbuffers);
+				sprintf_s(ws->log, "%p Sending stream data: %s", ws->hStream, rest.c_str());
+				ws->AddLog(hr, ws->log);
+			}
 		}
 	}
 
