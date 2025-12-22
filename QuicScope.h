@@ -43,6 +43,7 @@ struct SETTINGS
 	std::vector<std::string> Alpns;
 	std::string cert_options;
 	int DatagramsEnabled = 0;
+	bool IsHTTP3 = false;
 };
 
 

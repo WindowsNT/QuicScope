@@ -26,14 +26,17 @@ int main(int argc,char** argv)
 	std::string cert_options;
 	int RegistrationProfile = 0;
 	int DatagramEnabled = 0;
+	bool IsHTTP3 = 0;
 	app.add_option("-s,--server", ServerPorts, "Ports");
 	app.add_option("-f,--forward", Forwards, "Forwards");
 	app.add_option("-c,--client", Clients, "Clients");
 	app.add_option("-o,--output", OutputFolder, "Output folder");
 	app.add_option("-d", DatagramEnabled, "Datagrams Enabled");
+	app.add_flag("--h3", IsHTTP3, "HTTP3 mode");
 	app.add_option("--profile", RegistrationProfile, "Registration Profile");
 	app.add_option("--alpn", Alpns, "Alpn");
 	app.add_option("--cert", cert_options,"Certificate");
+
 
 
 	try
@@ -44,6 +47,13 @@ int main(int argc,char** argv)
 	{
 		app.exit(e);
 		return 0;
+	}
+
+	if (IsHTTP3)
+	{
+		// If not h3 found
+		if (std::find(Alpns.begin(), Alpns.end(), "h3") == Alpns.end())
+			Alpns.push_back("h3");
 	}
 
 	if (OutputFolder.size() > 0)	
@@ -67,6 +77,7 @@ int main(int argc,char** argv)
 	set.RegistrationProfile = RegistrationProfile;
 	set.cert_options = cert_options;
 	set.DatagramsEnabled = DatagramEnabled;
+	set.IsHTTP3 = IsHTTP3;
 
 
 	CreateServers(ServerPorts,set);

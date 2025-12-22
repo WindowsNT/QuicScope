@@ -420,68 +420,6 @@ public:
 	}
 
 
-	std::tuple<HCERTSTORE, std::vector<PCCERT_CONTEXT>> RequestCertificateWithChain()
-	{
-		std::lock_guard<std::recursive_mutex> lock(mtx);
-		std::vector<PCCERT_CONTEXT> chainCerts;
-
-		if (!bundle)
-			return {};
-
-		PCCERT_CONTEXT ctx = nullptr;
-		for (;;)
-		{
-			ctx = CertEnumCertificatesInStore(bundle->hCertStore, ctx);
-			if (!ctx)
-				break;
-
-			HCRYPTPROV_OR_NCRYPT_KEY_HANDLE k = 0;
-			DWORD ks = 0;
-			BOOL freeKey = 0;
-			if (!CryptAcquireCertificatePrivateKey(ctx, CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG, nullptr, &k, &ks, &freeKey))
-				continue;
-
-			if (k)
-			{
-				if (freeKey)
-				{
-					if (ks == CERT_NCRYPT_KEY_SPEC)
-						NCryptFreeObject(k);
-					else
-						CryptReleaseContext(k, 0);
-				}
-
-				CERT_CHAIN_PARA chainPara = {};
-				chainPara.cbSize = sizeof(chainPara);
-
-				PCCERT_CHAIN_CONTEXT pChainContext = nullptr;
-				if (CertGetCertificateChain(
-					nullptr,  // default chain engine
-					ctx,
-					nullptr,  // current time
-					bundle->hCertStore,
-					&chainPara,
-					0,
-					nullptr,
-					&pChainContext))
-				{
-					for (DWORD i = 0; i < pChainContext->cChain; i++)
-					{
-						for (DWORD j = 0; j < pChainContext->rgpChain[i]->cElement; j++)
-						{
-							PCCERT_CONTEXT element = pChainContext->rgpChain[i]->rgpElement[j]->pCertContext;
-							chainCerts.push_back(element); 
-						}
-					}
-					CertFreeCertificateChain(pChainContext);
-				}
-
-				return std::make_tuple(bundle->hCertStore, chainCerts);
-			}
-		}
-
-		return {};
-	}
 
 
 	HCRYPTPROV_OR_NCRYPT_KEY_HANDLE RequestPrivateKey()
@@ -782,7 +720,7 @@ public:
 		DWORD hashSize = 0;
 		if (GetCertificateHash(bundle->pCertContext, hash, &hashSize)) {
 			// Print hash in JavaScript format
-			PrintHashForJavaScript(hash, hashSize);
+			//PrintHashForJavaScript(hash, hashSize);
 			// Convert hash to hex string
 			char hashHex[65] = {};
 			for (DWORD i = 0; i < hashSize; i++) {
