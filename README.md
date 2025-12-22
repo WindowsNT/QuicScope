@@ -15,9 +15,9 @@ Soon to be announced.
 -d <0|1>		 Disable (default) or Enable datagrams. 
 --h3			 Enable HTTP/3 protocol.	
 --profile <p>	 Registration profile. <p> is one of the constants in https://microsoft.github.io/msquic/msquicdocs/docs/api/QUIC_REGISTRATION_CONFIG.html
---alpn	<a>	     ALPN to use for connections. You may use --alpn multiple times to register multiple ALPNs. If --h3 is used, the HTTP/3 ALPN will be added automatically.
---cert <c>		 Certificate file and password to use for servers. This is for example c:\1.pfx,12345678
-				 If you use <self>, a self-signed certificate will be generated and used with SNI 127.0.0.1, the local IPv4, the external IPv4 and the external IPv6
+--alpn	<a>	     ALPN to use for connections. You may use --alpn multiple times to register multiple ALPNs. If --h3 is used, the HTTP/3 ALPN "h3" will be added automatically.
+--cert <c>		 Certificate file and password to use for servers. Currently only "self" is supported, later this would be for example c:\1.pfx,12345678
+				 If you use "self", a self-signed certificate will be generated and used with SNI 127.0.0.1, the local IPv4, the external IPv4 and the external IPv6
 ```	
 
 # Commands
@@ -25,6 +25,7 @@ For all commands you may specify `-s index` or `-c index` or `-e index` to speci
 
 ```
 quit			- Quit the application
+list			- Shows info
 start			- Starts a bidirectional stream
 datagram		- Sends a datagram.  For example datagram -s 0 "Hello there" sends a datagram from server 0 with the content "Hello there".
 stream			- Sends data, for example stream -c 1 "Hello there".

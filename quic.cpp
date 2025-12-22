@@ -2,7 +2,8 @@
 
 extern std::string OutputFolder;
 class QuicServer;
-class QuicClient;
+class QuicServer;
+class QuicCommon;
 class QuicConnection;
 class QuicForward;
 
@@ -205,6 +206,7 @@ struct A_HEADER
 	std::string hvalue;
 };
 
+
 class QuicConnection : public QuicLog
 {
 public:
@@ -213,6 +215,7 @@ public:
 
 		nghttp3_conn* Http3 = 0;
 		std::vector<A_HEADER> A_Request;
+		QuicCommon* parent = 0;
 
 		int IsHTTP3 = 0; // 0 no ,1  server , 2 client
 
@@ -319,8 +322,20 @@ public:
 		}
 
 
+		void DeleteDeadStreams()
+		{
+			for (int i = (int)Streams.size() - 1; i >= 0; i--)
+			{
+				if (!Streams[i]->hStream)
+				{
+					Streams.erase(Streams.begin() + i);
+				}
+			}
+		}
 
-		QUIC_STATUS InitializeHttp3()
+
+
+		QUIC_STATUS InitializeHttp3(bool Server)
 		{
 			nghttp3_callbacks callbacks = {};
 			callbacks.recv_header = [](nghttp3_conn* conn, int64_t stream_id,
@@ -373,9 +388,18 @@ public:
 			settings.enable_web_transport = 1;
 			settings.enable_webtransport_datagrams = 1;
 
-			int rv = nghttp3_conn_server_new(&Http3, &callbacks, &settings, 0, (void*)this);
-			if (rv != 0)
-				return QUIC_STATUS_INTERNAL_ERROR;
+			if (Server)
+			{
+				int rv = nghttp3_conn_server_new(&Http3, &callbacks, &settings, 0, (void*)this);
+				if (rv != 0)
+					return QUIC_STATUS_INTERNAL_ERROR;
+			}
+			else
+			{
+				int rv = nghttp3_conn_client_new(&Http3, &callbacks, &settings, 0, (void*)this);
+				if (rv != 0)
+					return QUIC_STATUS_INTERNAL_ERROR;
+			}
 
 			return QUIC_STATUS_SUCCESS;
 		}
@@ -452,151 +476,19 @@ public:
 			return QUIC_STATUS_SUCCESS;
 		}
 
-		QUIC_STATUS ConnectionCallback([[maybe_unused]] HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
-		{
-			if (!Event)
-				return QUIC_STATUS_INVALID_PARAMETER;
-			if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED)
-			{
-				HQUIC Stream = Event->PEER_STREAM_STARTED.Stream;
-				sprintf_s(log, 1000, "%p Peer Stream Started", Stream);
-				AddLog(S_OK, log);
-				auto str = std::make_shared<QuicStream>(qt, hConnection, Stream,this);
-				// Get the ID
-				int64_t stream_id = 0;
-				uint32_t bl = 8;
-				qt->GetParam(
-					Stream,
-					QUIC_PARAM_STREAM_ID,
-					&bl,
-					&stream_id
-				);
-				str->StreamID = stream_id;
-				str->Remote = 1;
-				Streams.push_back(str);
-
-				bool IsUnidirectional = Event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL;
-				str->Bi = !IsUnidirectional;
-
-				// enable auto-delivery
-				auto qs = qt->StreamReceiveSetEnabled(Stream, TRUE);
-
-				qt->SetCallbackHandler(
-					Stream,
-					[](_In_ HQUIC Stream, _In_opt_ void* Context, _Inout_ QUIC_STREAM_EVENT* Event)
-					{
-						QuicStream* session = (QuicStream*)Context;
-						if (session == 0)
-							return QUIC_STATUS_INVALID_STATE;
-						return session->StreamCallback(Stream, Event);
-					},
-					str.get()
-				);
+		QUIC_STATUS ConnectionCallback([[maybe_unused]] HQUIC Connection, QUIC_CONNECTION_EVENT* Event);
 
 
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
-			{
-				sprintf_s(log, 1000, "%p Connection Shutting down by transport", hConnection);
-				AddLog(Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status, log);
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE)
-			{
-				sprintf_s(log,1000,"%p Connection Shutdown Complete",hConnection);
-				AddLog(S_FALSE, log);
-				qt->ConnectionClose(hConnection);
-				hConnection = 0;
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED)
-			{
-				std::string fulllog;
-				sprintf_s(log, 1000, "%p Connection Established", hConnection);
-				fulllog += log;
-				if (Event->CONNECTED.NegotiatedAlpn)
-				{
-					// not null terminated
-					std::string alpn((char*)Event->CONNECTED.NegotiatedAlpn, Event->CONNECTED.NegotiatedAlpnLength);
-					sprintf_s(log, 1000, " Alpn: %s", alpn.c_str());
-					fulllog += log;
-				}
-				AddLog(S_OK,fulllog.c_str());
-
-				// My streams
-				if (IsHTTP3 == 1)
-				{
-					InitializeHttp3();
-					CreateHttp3Streams();
-				}
-
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_IDEAL_PROCESSOR_CHANGED)
-				return QUIC_STATUS_SUCCESS;
-			if (Event->Type == QUIC_CONNECTION_EVENT_PEER_NEEDS_STREAMS)
-				return QUIC_STATUS_SUCCESS;
-			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED)
-			{
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE)
-			{
-				auto& r = Event->STREAMS_AVAILABLE;
-				sprintf_s(log, 1000, " Streams Available - Bi: %d Uni: %d", r.BidirectionalCount, r.UnidirectionalCount);
-				AddLog(S_FALSE, log);
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED)
-			{
-				Event->DATAGRAM_SEND_STATE_CHANGED.State;
-				auto& recv = Event->DATAGRAM_SEND_STATE_CHANGED;
-				TOT_BUFFERS* buf = (TOT_BUFFERS*)recv.ClientContext;
-				if (buf && recv.State == QUIC_DATAGRAM_SEND_SENT)
-					delete buf;
-				return QUIC_STATUS_SUCCESS;
-			}
-			if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED)
-			{
-				std::string msg;
-				if (OutputFolder.size())
-				{
-					// Save to datagrams for this connection
-					char filename[1000] = {};
-					sprintf_s(filename, 1000, "%s\\datagram_%p.bin", OutputFolder.c_str(), hConnection);
-					std::ofstream ofs(filename, std::ios::out | std::ios::app | std::ios::binary);
-					ofs.write((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length);
-					ofs.close();
-				}
-				msg = Event->DATAGRAM_RECEIVED.Buffer ? std::string((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length) : "";
-				auto TestSize = msg.size();
-				auto TestPtr = msg.data();
-				if (TestSize > 1 && msg[0] == 0)
-				{
-					TestSize--;
-					TestPtr++;
-				}
-				if (is_printable_or_utf8(TestPtr, (int)TestSize))
-				{
-					sprintf_s(log, 2000, "Datagram received: %s", TestPtr);
-					AddLog(S_OK, log);
-				}
-				return QUIC_STATUS_SUCCESS;
-			}
-			sprintf_s(log, 1000, " Connection Event: %d", Event->Type);
-			AddLog(S_FALSE, log);
-			return QUIC_STATUS_SUCCESS;
-		}
 		void SetConnection(HQUIC hConn,bool SetH)
 		{
 			hConnection = hConn;
 			if (SetH)
 				qt->SetCallbackHandler(hConnection, [](HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event) {	return ((QuicConnection*)Context)->ConnectionCallback(Connection, Event); }, this);
 		}
-		QuicConnection(const QUIC_API_TABLE* qqt)
+		QuicConnection(const QUIC_API_TABLE* qqt,QuicCommon* par)
 		{
 			qt = qqt;
+			parent = par;
 		}
 		void End()
 		{
@@ -614,127 +506,6 @@ public:
 };
 
 
-QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREAM_EVENT* Event)
-{
-	if (!Event)
-		return QUIC_STATUS_INVALID_PARAMETER;
-
-	if (Event->Type == QUIC_STREAM_EVENT_RECEIVE)
-	{
-		auto& r = Event->RECEIVE;
-		if (r.BufferCount == 0)
-			return QUIC_STATUS_SUCCESS;
-		size_t total_length = 0;
-		for (uint32_t i = 0; i < r.BufferCount; i++)
-			total_length += r.Buffers[i].Length;
-		void* ptr = r.Buffers[0].Buffer;
-		std::vector<uint8_t> data;
-		if (r.BufferCount > 1)
-		{
-			data.resize(total_length);
-			size_t offset = 0;
-			for (uint32_t i = 0; i < r.BufferCount; i++)
-			{
-				memcpy(data.data() + offset, r.Buffers[i].Buffer, r.Buffers[i].Length);
-				offset += r.Buffers[i].Length;
-			}
-			ptr = data.data();
-		}
-		sprintf_s(log, 1000, "%p Stream Receive %llu bytes", hStream, total_length);
-		AddLog(S_OK, log);
-		std::string msg;
-		msg = std::string((char*)ptr, total_length);
-		if (is_printable_or_utf8(msg.c_str(), (int)msg.size()))
-		{
-			sprintf_s(log, 2000, "Stream message received: %s", msg.c_str());
-			AddLog(S_OK, log);
-		}
-
-		if (OutputFolder.size())
-		{
-			// Save to streams for this connection
-			char filename[1000] = {};
-			sprintf_s(filename, 1000, "%s\\stream%p_%p.bin", OutputFolder.c_str(), hConnection,hStream);
-			std::ofstream ofs(filename, std::ios::out | std::ios::app | std::ios::binary);
-			ofs.write((char*)ptr, total_length);
-			ofs.close();
-		}
-		if (conn && conn->Http3)
-		{
-			int fin = 0;
-			if (r.Flags & QUIC_RECEIVE_FLAG_FIN)
-				fin = 1;
-			auto rv = nghttp3_conn_read_stream(conn->Http3, StreamID, (const uint8_t*)ptr, total_length,fin);
-			if (rv < 0) {
-				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,0);
-				return QUIC_STATUS_INTERNAL_ERROR;
-			}
-			// Flush WebTransport
-			return conn->FlushX();
-		}
-
-		return QUIC_STATUS_SUCCESS;
-	}
-
-	if (Event->Type == QUIC_STREAM_EVENT_START_COMPLETE)
-	{
-		StreamID = Event->START_COMPLETE.ID;
-		sprintf_s(log, 1000, "%p Stream Start Complete ID=%llu", hStream, StreamID);
-		AddLog(S_OK, log);
-		if (conn && conn->Http3)
-		{
-			auto all_ready = conn->AreHttp3StreamsReady();
-			if (all_ready && !conn->Http3Bound)
-			{
-				conn->Http3Bound = 1;
-				auto id1 = conn->Streams[all_ready->at(0)]->StreamID;
-				auto id2 = conn->Streams[all_ready->at(1)]->StreamID;
-				auto id3 = conn->Streams[all_ready->at(2)]->StreamID;
-				nghttp3_ssize rv = nghttp3_conn_bind_control_stream(conn->Http3, id1);
-				if (rv < 0)
-					return QUIC_STATUS_INTERNAL_ERROR;
-				rv = nghttp3_conn_bind_qpack_streams(conn->Http3, id2, id3);
-				if (rv < 0)
-					return QUIC_STATUS_INTERNAL_ERROR;
-				// Flush WebTransport
-				return conn->FlushX();
-			}
-		}
-		return QUIC_STATUS_SUCCESS;
-	}
-
-	if (Event->Type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
-	{
-		sprintf_s(log, 1000, "%p Stream Shutdown Complete", hStream);
-		AddLog(S_OK, log);
-		qt->StreamClose(hStream);
-		hStream = 0;
-		return QUIC_STATUS_SUCCESS;
-	}
-	if (Event->Type == QUIC_STREAM_EVENT_SEND_COMPLETE)
-	{
-		TOT_BUFFERS* tot = (TOT_BUFFERS*)Event->SEND_COMPLETE.ClientContext;
-		auto total_bytes_size = 0;
-		for (auto& t : tot->buffers)
-			total_bytes_size += t.Length;
-		delete tot;
-		if (conn && conn->Http3)
-		{
-			int rv = nghttp3_conn_add_ack_offset(conn->Http3, StreamID, total_bytes_size);
-			if (rv != 0) {
-				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE,0);
-				return QUIC_STATUS_INTERNAL_ERROR;
-			}
-			// Go again
-			return conn->FlushX();
-		}
-		return QUIC_STATUS_SUCCESS;
-	}
-	sprintf_s(log, 1000, "%p Stream Event: %d", hStream, Event->Type);
-	AddLog(S_OK, log);
-	return QUIC_STATUS_SUCCESS;
-}
-
 
 class QuicCommon : public QuicLog
 {
@@ -744,6 +515,7 @@ private:
 	std::string cert;
 
 protected:
+	bool IsHTTP3 = 0;
 	int rp = 0;
 	HQUIC hRegistration = 0;
 	HQUIC hConfiguration = 0;
@@ -858,6 +630,17 @@ public:
 		hr = LoadCertificate(cert);
 		return hr;
 	}
+
+	void DeleteDeadConnections()
+	{
+		for (int i = (int)Connections.size() - 1; i >= 0; i--)
+		{
+			if (!Connections[i]->hConnection)
+			{
+				Connections.erase(Connections.begin() + i);
+			}
+		}
+	}
 	virtual void End()
 	{
 		for (auto& c : Connections)
@@ -890,11 +673,12 @@ protected:
 	int ListenPort = 0;
 	bool Use4 = 0;
 	bool Use6 = 0;
-	bool IsHTTP3 = 0;
 	HQUIC hListener4 = 0;
 	HQUIC hListener6 = 0;
 
 public:
+
+	int GetListenPort() { return ListenPort; };
 	QuicServer(int liport, int Ip46,SETTINGS& s) : QuicCommon(s)
 	{
 		LoadAlpns(s.Alpns, AlpnBuffers);
@@ -994,7 +778,7 @@ public:
 			{
 				return hr;
 			}
-			auto conn = std::make_shared<QuicConnection>(qt);
+			auto conn = std::make_shared<QuicConnection>(qt,this);
 			conn->IsHTTP3 = IsHTTP3;
 			conn->SetConnection(NewConnection,true);
 			
@@ -1042,6 +826,16 @@ public:
 			if (FAILED(hr))
 				return hr;
 		}
+		if (IsHTTP3)
+		{
+			std::cout << "You can try it with https://www.turbo-play.com/rcstest.php?ip=127.0.0.1&port=";
+			std::cout << ListenPort;
+			std::cout << "&hash=";
+			std::cout << dhtp->RequestGetForCert2();
+			std::cout << std::endl;
+		}
+
+
 		return hr;
 	}
 	virtual void End() override
@@ -1068,10 +862,14 @@ class QuicClient : public QuicCommon
 	std::string host;
 	int port = 0;
 public:
+
+	std::string GetHost() { return host; };
+	int GetPort() { return port; };
 	QuicClient(std::string _host,int _port, SETTINGS& s) : QuicCommon(s)
 	{
 		host = _host;
 		port = _port;
+		IsHTTP3 = s.IsHTTP3;
 	}
 	~QuicClient()
 	{
@@ -1085,7 +883,7 @@ public:
 		// Connect to host:port
 		HQUIC hConnection = 0;
 
-		auto connection = std::make_shared<QuicConnection>(qt);
+		auto connection = std::make_shared<QuicConnection>(qt,this);
 		hr = qt->ConnectionOpen(hRegistration, [](
 			_In_ HQUIC Connection,
 			_In_opt_ void* Context,
@@ -1099,6 +897,7 @@ public:
 		if (!hConnection)
 			return E_FAIL;	
 		connection->SetConnection(hConnection,true);
+		connection->IsHTTP3 = IsHTTP3;
 		Connections.push_back(connection);
 		hr = qt->ConnectionStart(hConnection, hConfiguration, strchr(host.c_str(), ':') ? QUIC_ADDRESS_FAMILY_INET6 : QUIC_ADDRESS_FAMILY_INET,
 			host.c_str(), (uint16_t)port);
@@ -1118,6 +917,293 @@ public:
 	{
 	}
 };
+
+
+
+
+
+QUIC_STATUS QuicConnection::ConnectionCallback([[maybe_unused]] HQUIC Connection, QUIC_CONNECTION_EVENT* Event)
+{
+	if (!Event)
+		return QUIC_STATUS_INVALID_PARAMETER;
+	if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED)
+	{
+		HQUIC Stream = Event->PEER_STREAM_STARTED.Stream;
+		// Get the ID
+		int64_t stream_id = 0;
+		uint32_t bl = 8;
+		qt->GetParam(
+			Stream,
+			QUIC_PARAM_STREAM_ID,
+			&bl,
+			&stream_id
+		);
+		sprintf_s(log, 1000, "%p Peer Stream Started ID=%lli", Stream, stream_id);
+		AddLog(S_OK, log);
+		auto str = std::make_shared<QuicStream>(qt, hConnection, Stream, this);
+		str->StreamID = stream_id;
+		str->Remote = 1;
+		Streams.push_back(str);
+
+		bool IsUnidirectional = Event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL;
+		str->Bi = !IsUnidirectional;
+
+		// enable auto-delivery
+		auto qs = qt->StreamReceiveSetEnabled(Stream, TRUE);
+
+		qt->SetCallbackHandler(
+			Stream,
+			[](_In_ HQUIC Stream, _In_opt_ void* Context, _Inout_ QUIC_STREAM_EVENT* Event)
+			{
+				QuicStream* session = (QuicStream*)Context;
+				if (session == 0)
+					return QUIC_STATUS_INVALID_STATE;
+				return session->StreamCallback(Stream, Event);
+			},
+			str.get()
+		);
+
+
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
+	{
+		sprintf_s(log, 1000, "%p Connection Shutting down by transport", hConnection);
+		AddLog(Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status, log);
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE)
+	{
+		sprintf_s(log, 1000, "%p Connection Shutdown Complete", hConnection);
+		AddLog(S_FALSE, log);
+		qt->ConnectionClose(hConnection);
+		hConnection = 0;
+		if (parent)
+			parent->DeleteDeadConnections();
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED)
+	{
+		std::string fulllog;
+		sprintf_s(log, 1000, "%p Connection Established", hConnection);
+		fulllog += log;
+		if (Event->CONNECTED.NegotiatedAlpn)
+		{
+			// not null terminated
+			std::string alpn((char*)Event->CONNECTED.NegotiatedAlpn, Event->CONNECTED.NegotiatedAlpnLength);
+			sprintf_s(log, 1000, " Alpn: %s", alpn.c_str());
+			fulllog += log;
+		}
+		AddLog(S_OK, fulllog.c_str());
+
+		// My streams
+		if (IsHTTP3 == 1)
+		{
+			bool IsServer = 0;
+			if (parent)
+			{
+				QuicServer* ps = dynamic_cast<QuicServer*>(parent);
+				if (ps)
+					IsServer = 1;
+			}
+			InitializeHttp3(IsServer);
+			CreateHttp3Streams();
+		}
+
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_IDEAL_PROCESSOR_CHANGED)
+		return QUIC_STATUS_SUCCESS;
+	if (Event->Type == QUIC_CONNECTION_EVENT_PEER_NEEDS_STREAMS)
+		return QUIC_STATUS_SUCCESS;
+	if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED)
+	{
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE)
+	{
+		auto& r = Event->STREAMS_AVAILABLE;
+		sprintf_s(log, 1000, " Streams Available - Bi: %d Uni: %d", r.BidirectionalCount, r.UnidirectionalCount);
+		AddLog(S_FALSE, log);
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED)
+	{
+		Event->DATAGRAM_SEND_STATE_CHANGED.State;
+		auto& recv = Event->DATAGRAM_SEND_STATE_CHANGED;
+		TOT_BUFFERS* buf = (TOT_BUFFERS*)recv.ClientContext;
+		if (buf && recv.State == QUIC_DATAGRAM_SEND_SENT)
+			delete buf;
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED)
+	{
+		std::string msg;
+		if (OutputFolder.size())
+		{
+			// Save to datagrams for this connection
+			char filename[1000] = {};
+			sprintf_s(filename, 1000, "%s\\datagram_%p.bin", OutputFolder.c_str(), hConnection);
+			std::ofstream ofs(filename, std::ios::out | std::ios::app | std::ios::binary);
+			ofs.write((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length);
+			ofs.close();
+		}
+		msg = Event->DATAGRAM_RECEIVED.Buffer ? std::string((char*)Event->DATAGRAM_RECEIVED.Buffer->Buffer, Event->DATAGRAM_RECEIVED.Buffer->Length) : "";
+		auto TestSize = msg.size();
+		auto TestPtr = msg.data();
+		if (TestSize > 1 && msg[0] == 0)
+		{
+			TestSize--;
+			TestPtr++;
+		}
+		if (is_printable_or_utf8(TestPtr, (int)TestSize))
+		{
+			sprintf_s(log, 2000, "Datagram received: %s", TestPtr);
+			AddLog(S_OK, log);
+		}
+		return QUIC_STATUS_SUCCESS;
+	}
+	sprintf_s(log, 1000, " Connection Event: %d", Event->Type);
+	AddLog(S_FALSE, log);
+	return QUIC_STATUS_SUCCESS;
+}
+
+QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREAM_EVENT* Event)
+{
+	if (!Event)
+		return QUIC_STATUS_INVALID_PARAMETER;
+
+	if (Event->Type == QUIC_STREAM_EVENT_RECEIVE)
+	{
+		auto& r = Event->RECEIVE;
+		if (r.BufferCount == 0)
+			return QUIC_STATUS_SUCCESS;
+		size_t total_length = 0;
+		for (uint32_t i = 0; i < r.BufferCount; i++)
+			total_length += r.Buffers[i].Length;
+		void* ptr = r.Buffers[0].Buffer;
+		std::vector<uint8_t> data;
+		if (r.BufferCount > 1)
+		{
+			data.resize(total_length);
+			size_t offset = 0;
+			for (uint32_t i = 0; i < r.BufferCount; i++)
+			{
+				memcpy(data.data() + offset, r.Buffers[i].Buffer, r.Buffers[i].Length);
+				offset += r.Buffers[i].Length;
+			}
+			ptr = data.data();
+		}
+		sprintf_s(log, 1000, "%p Stream Receive %llu bytes", hStream, total_length);
+		AddLog(S_OK, log);
+		std::string msg;
+		msg = std::string((char*)ptr, total_length);
+		if (is_printable_or_utf8(msg.c_str(), (int)msg.size()))
+		{
+			sprintf_s(log, 2000, "Stream message received: %s", msg.c_str());
+			AddLog(S_OK, log);
+		}
+
+		if (OutputFolder.size())
+		{
+			// Save to streams for this connection
+			char filename[1000] = {};
+			sprintf_s(filename, 1000, "%s\\stream%p_%p.bin", OutputFolder.c_str(), hConnection, hStream);
+			std::ofstream ofs(filename, std::ios::out | std::ios::app | std::ios::binary);
+			ofs.write((char*)ptr, total_length);
+			ofs.close();
+		}
+		if (conn && conn->Http3)
+		{
+			int fin = 0;
+			if (r.Flags & QUIC_RECEIVE_FLAG_FIN)
+				fin = 1;
+			auto rv = nghttp3_conn_read_stream(conn->Http3, StreamID, (const uint8_t*)ptr, total_length, fin);
+			if (rv < 0) {
+				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+				return QUIC_STATUS_INTERNAL_ERROR;
+			}
+			// Flush WebTransport
+			return conn->FlushX();
+		}
+
+		return QUIC_STATUS_SUCCESS;
+	}
+
+	if (Event->Type == QUIC_STREAM_EVENT_START_COMPLETE)
+	{
+		StreamID = Event->START_COMPLETE.ID;
+		sprintf_s(log, 1000, "%p Stream Start Complete ID=%llu", hStream, StreamID);
+		AddLog(S_OK, log);
+		if (conn && conn->Http3)
+		{
+			auto all_ready = conn->AreHttp3StreamsReady();
+			if (all_ready && !conn->Http3Bound)
+			{
+				conn->Http3Bound = 1;
+				auto id1 = conn->Streams[all_ready->at(0)]->StreamID;
+				auto id2 = conn->Streams[all_ready->at(1)]->StreamID;
+				auto id3 = conn->Streams[all_ready->at(2)]->StreamID;
+				nghttp3_ssize rv = nghttp3_conn_bind_control_stream(conn->Http3, id1);
+				if (rv < 0)
+					return QUIC_STATUS_INTERNAL_ERROR;
+				rv = nghttp3_conn_bind_qpack_streams(conn->Http3, id2, id3);
+				if (rv < 0)
+					return QUIC_STATUS_INTERNAL_ERROR;
+				// Flush WebTransport
+				return conn->FlushX();
+			}
+		}
+		return QUIC_STATUS_SUCCESS;
+	}
+
+	if (Event->Type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
+	{
+		sprintf_s(log, 1000, "%p Stream Shutdown Complete", hStream);
+		AddLog(S_OK, log);
+		qt->StreamClose(hStream);
+		hStream = 0;
+		if (conn)
+			conn->DeleteDeadStreams();
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_STREAM_EVENT_SEND_COMPLETE)
+	{
+		TOT_BUFFERS* tot = (TOT_BUFFERS*)Event->SEND_COMPLETE.ClientContext;
+		auto total_bytes_size = 0;
+		for (auto& t : tot->buffers)
+			total_bytes_size += t.Length;
+		delete tot;
+		if (conn && conn->Http3)
+		{
+			int rv = nghttp3_conn_add_ack_offset(conn->Http3, StreamID, total_bytes_size);
+			if (rv != 0) {
+				qt->ConnectionShutdown(hConnection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+				return QUIC_STATUS_INTERNAL_ERROR;
+			}
+			// Go again
+			return conn->FlushX();
+		}
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE)
+	{
+		auto& s = Event->SEND_SHUTDOWN_COMPLETE;
+		sprintf_s(log, 1000, "%p Stream Send Shutdown Complete, Graceful=%i", hStream, (bool)s.Graceful);
+		AddLog(S_FALSE, log);
+		return QUIC_STATUS_SUCCESS;
+	}
+	if (Event->Type == QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN)
+	{
+		sprintf_s(log, 1000, "%p Stream Peer Send Shutdown", hStream);
+		AddLog(S_FALSE, log);
+		return QUIC_STATUS_SUCCESS;
+	}
+	sprintf_s(log, 1000, "%p Stream Event: %d", hStream, Event->Type);
+	AddLog(S_OK, log);
+	return QUIC_STATUS_SUCCESS;
+}
+
 
 
 std::vector<std::shared_ptr<QuicServer>> Servers;
@@ -1262,6 +1348,32 @@ void Loop()
 			if (WhatStream == -1 && wc->Streams.size() > 0)
 			{
 				ws = wc->Streams[0].get();
+			}
+		}
+
+		if (command == "list")
+		{
+			for (auto& j : Servers)
+			{
+				sprintf_s(j->log, "Server on port %d Connections: %d", j->GetListenPort(), (int)j->GetConnections().size());
+				std::cout << j->log << std::endl;
+				auto& conns = j->GetConnections();
+				for (auto& c : conns)
+				{
+					sprintf_s(j->log, "Connection %p Streams: %d", c->hConnection, (int)c->Streams.size());
+					std::cout << j->log << std::endl;
+				}
+			}
+			for (auto& j : Clients)
+			{
+				sprintf_s(j->log, "Client to %s:%d Connections: %d", j->GetHost().c_str(), j->GetPort(), (int)j->GetConnections().size());
+				std::cout << j->log << std::endl;
+				auto& conns = j->GetConnections();
+				for (auto& c : conns)
+				{
+					sprintf_s(j->log, "Connection %p Streams: %d", c->hConnection, (int)c->Streams.size());
+					std::cout << j->log << std::endl;
+				}
 			}
 		}
 
