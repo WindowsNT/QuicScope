@@ -22,8 +22,11 @@ Soon to be announced.
 
 # After running, commands
 For all commands you may specify `-s index` or `-c index` or `-e index` to specify which server/client/connection index to use.
+
+```
 quit			- Quit the applicati
 start			- Starts a bidirectional stream
 datagram		- Sends a datagram.  For example datagram -s 0 "Hello there" sends a datagram from server 0 with the content "Hello there".
 stream			- Sends data, for example stream -c 1 "Hello there".
+```
 
