@@ -20,11 +20,11 @@ Soon to be announced.
 				 If you use <self>, a self-signed certificate will be generated and used with SNI 127.0.0.1, the local IPv4, the external IPv4 and the external IPv6
 ```	
 
-# After running, commands
+# Commands
 For all commands you may specify `-s index` or `-c index` or `-e index` to specify which server/client/connection index to use.
 
 ```
-quit			- Quit the applicati
+quit			- Quit the application
 start			- Starts a bidirectional stream
 datagram		- Sends a datagram.  For example datagram -s 0 "Hello there" sends a datagram from server 0 with the content "Hello there".
 stream			- Sends data, for example stream -c 1 "Hello there".
