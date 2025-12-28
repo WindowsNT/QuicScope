@@ -362,22 +362,25 @@ public:
 					QuicConnection* session = (QuicConnection*)conn_user_data;
 					return 0;
 				};
-			callbacks.begin_headers = [](nghttp3_conn* conn, int64_t stream_id,
-				void* conn_user_data,
-				void* stream_user_data)
-				{
-					QuicConnection* session = (QuicConnection*)conn_user_data;
-					session->A_Request.clear();
-					return 0;
-				};
-			callbacks.end_headers = [](nghttp3_conn* conn, int64_t stream_id,
-				int fin, void* conn_user_data,
-				void* stream_user_data)
-				{
-					QuicConnection* session = (QuicConnection*)conn_user_data;
-					session->Send200(stream_id, 0);
-					return 0;
-				};
+			if (Server)
+			{
+				callbacks.begin_headers = [](nghttp3_conn* conn, int64_t stream_id,
+					void* conn_user_data,
+					void* stream_user_data)
+					{
+						QuicConnection* session = (QuicConnection*)conn_user_data;
+						session->A_Request.clear();
+						return 0;
+					};
+				callbacks.end_headers = [](nghttp3_conn* conn, int64_t stream_id,
+					int fin, void* conn_user_data,
+					void* stream_user_data)
+					{
+						QuicConnection* session = (QuicConnection*)conn_user_data;
+						session->Send200(stream_id, fin);
+						return 0;
+					};
+			}
 
 			nghttp3_settings settings = {};
 			nghttp3_settings_default(&settings);
@@ -617,7 +620,7 @@ public:
 		settings.PeerUnidiStreamCount = 512;
 
 		settings.IsSet.IdleTimeoutMs = TRUE;
-		settings.IdleTimeoutMs = 60000;
+		settings.IdleTimeoutMs = 120000;
 
 		settings.IsSet.DatagramReceiveEnabled = TRUE;
 		settings.DatagramReceiveEnabled = UseDatagram;
@@ -969,6 +972,8 @@ QUIC_STATUS QuicConnection::ConnectionCallback([[maybe_unused]] HQUIC Connection
 	if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
 	{
 		sprintf_s(log, 1000, "%p Connection Shutting down by transport", hConnection);
+		if (IsHTTP3 == 1 && Http3)
+			nghttp3_conn_shutdown(Http3);
 		AddLog(Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status, log);
 		return QUIC_STATUS_SUCCESS;
 	}
@@ -976,6 +981,8 @@ QUIC_STATUS QuicConnection::ConnectionCallback([[maybe_unused]] HQUIC Connection
 	{
 		sprintf_s(log, 1000, "%p Connection Shutdown Complete", hConnection);
 		AddLog(S_FALSE, log);
+		if (IsHTTP3 == 1 && Http3)
+			nghttp3_conn_del(Http3);
 		qt->ConnectionClose(hConnection);
 		hConnection = 0;
 		if (parent)
@@ -1094,7 +1101,7 @@ QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREA
 			}
 			ptr = data.data();
 		}
-		sprintf_s(log, 1000, "%p Stream Receive %llu bytes", hStream, total_length);
+		sprintf_s(log, 1000, "%p Stream [%zi] Receive %llu bytes", hStream,StreamID,  total_length);
 		AddLog(S_OK, log);
 		std::string msg;
 		msg = std::string((char*)ptr, total_length);
@@ -1145,9 +1152,13 @@ QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREA
 				auto id2 = conn->Streams[all_ready->at(1)]->StreamID;
 				auto id3 = conn->Streams[all_ready->at(2)]->StreamID;
 				nghttp3_ssize rv = nghttp3_conn_bind_control_stream(conn->Http3, id1);
+				sprintf_s(log, 1000, "Binding HTTP/3 control stream ID=%llu", id1);
+				AddLog(S_FALSE, log);
 				if (rv < 0)
 					return QUIC_STATUS_INTERNAL_ERROR;
 				rv = nghttp3_conn_bind_qpack_streams(conn->Http3, id2, id3);
+				sprintf_s(log, 1000, "Binding HTTP/3 QPACK streams ID=%llu (encoder) and ID=%llu (decoder)", id2, id3);
+				AddLog(S_FALSE, log);
 				if (rv < 0)
 					return QUIC_STATUS_INTERNAL_ERROR;
 				// Flush WebTransport
@@ -1161,6 +1172,7 @@ QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREA
 	{
 		sprintf_s(log, 1000, "%p Stream Shutdown Complete", hStream);
 		AddLog(S_OK, log);
+
 		qt->StreamClose(hStream);
 		hStream = 0;
 		if (conn)
@@ -1196,6 +1208,12 @@ QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREA
 	if (Event->Type == QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN)
 	{
 		sprintf_s(log, 1000, "%p Stream Peer Send Shutdown", hStream);
+		if (conn && conn->Http3)
+		{
+			nghttp3_conn_close_stream(conn->Http3, StreamID, 0);
+			conn->FlushX();
+		}
+
 		AddLog(S_FALSE, log);
 		return QUIC_STATUS_SUCCESS;
 	}
@@ -1421,6 +1439,34 @@ void Loop()
 			else
 			{
 				std::cout << "Invalid server/client/connection selection." << std::endl;
+			}
+		}
+
+		if (command == "request")
+		{
+			if (ws)
+			{
+				nghttp3_nv req[] = {
+					{ (uint8_t*)":method", (uint8_t*)"GET", 7, 3, NGHTTP3_NV_FLAG_NONE },
+					{ (uint8_t*)":scheme", (uint8_t*)"https", 7, 5, NGHTTP3_NV_FLAG_NONE },
+					{ (uint8_t*)":authority", (uint8_t*)"localhost.users.turbo-play.com", 10, 29, NGHTTP3_NV_FLAG_NONE },
+					{ (uint8_t*)":path", (uint8_t*)"/test.php", 5, 9, NGHTTP3_NV_FLAG_NONE },
+					{ (uint8_t*)"user-agent", (uint8_t*)"nghttp3-client", 10, 14, NGHTTP3_NV_FLAG_NONE }
+				};
+				nghttp3_data_reader dr = {};
+				dr.read_data = [](nghttp3_conn* conn, int64_t stream_id, nghttp3_vec* vec, size_t veccnt,
+					uint32_t* pflags, void* conn_user_data, void* stream_user_data) -> nghttp3_ssize
+				{
+					*pflags = NGHTTP3_DATA_FLAG_EOF;
+					return 0;
+				};
+				int rvx = nghttp3_conn_submit_request(ws->conn->Http3, ws->StreamID,req, 5, &dr,0);
+				if (rvx < 0)
+				{
+
+				}
+				else
+					ws->conn->FlushX();
 			}
 		}
 
