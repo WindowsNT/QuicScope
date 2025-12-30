@@ -781,18 +781,18 @@ public:
 				}
 				if (info.ClientAlpnList)
 				{
-					std::string alpn_list;
+					std::string alpn_list5;
 					size_t offset = 0;
 					while (offset < info.ClientAlpnListLength)
 					{
 						uint8_t alpn_len = info.ClientAlpnList[offset];
 						std::string alpn((char*)&info.ClientAlpnList[offset + 1], alpn_len);
-						if (alpn_list.size() > 0)
-							alpn_list += ", ";
-						alpn_list += alpn;
+						if (alpn_list5.size() > 0)
+							alpn_list5 += ", ";
+						alpn_list5 += alpn;
 						offset += alpn_len + 1;
 					}
-					sprintf_s(log, " ALPNs: %s ", alpn_list.c_str());
+					sprintf_s(log, " ALPNs: %s ", alpn_list5.c_str());
 					fulllog += log;
 				}
 				if (info.NegotiatedAlpn)
@@ -1018,7 +1018,7 @@ QUIC_STATUS QuicConnection::ConnectionCallback([[maybe_unused]] HQUIC Connection
 	}
 	if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT)
 	{
-		sprintf_s(log, 1000, "Connection Shutting down by transport");
+		sprintf_s(log, 1000, "[C%zi] Connection Shutting down by transport",qsindex + 1);
 		if (IsHTTP3 == 1 && Http3)
 			nghttp3_conn_shutdown(Http3);
 		AddLog(Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status, log);
@@ -1026,7 +1026,7 @@ QUIC_STATUS QuicConnection::ConnectionCallback([[maybe_unused]] HQUIC Connection
 	}
 	if (Event->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE)
 	{
-		sprintf_s(log, 1000, "Connection Shutdown Complete");
+		sprintf_s(log, 1000, "[C%zi] Connection Shutdown Complete", qsindex + 1);
 		AddLog(S_FALSE, log);
 		if (IsHTTP3 == 1 && Http3)
 			nghttp3_conn_del(Http3);
@@ -1216,7 +1216,7 @@ QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREA
 
 	if (Event->Type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
 	{
-		sprintf_s(log, 1000, "Stream Shutdown Complete");
+		sprintf_s(log, 1000, "[C%zi] [S%02zi] Stream Shutdown Complete", conn->qsindex + 1, StreamID);
 		AddLog(S_OK, log);
 
 		qt->StreamClose(hStream);
@@ -1247,13 +1247,13 @@ QUIC_STATUS QuicStream::StreamCallback([[maybe_unused]] HQUIC Stream, QUIC_STREA
 	if (Event->Type == QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE)
 	{
 		auto& s = Event->SEND_SHUTDOWN_COMPLETE;
-		sprintf_s(log, 1000, "Stream Send Shutdown Complete, Graceful=%i", (bool)s.Graceful);
+		sprintf_s(log, 1000, "[C%zi] [S%02zi] Stream Send Shutdown Complete, Graceful=%i",conn->qsindex + 1,StreamID, (bool)s.Graceful);
 		AddLog(S_FALSE, log);
 		return QUIC_STATUS_SUCCESS;
 	}
 	if (Event->Type == QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN)
 	{
-		sprintf_s(log, 1000, "Stream Peer Send Shutdown");
+		sprintf_s(log, 1000, "[C%zi] [S%02zi] Stream Peer Send Shutdown",conn->qsindex + 1, StreamID);
 		if (conn && conn->Http3)
 		{
 			nghttp3_conn_close_stream(conn->Http3, StreamID, 0);
@@ -1379,8 +1379,7 @@ void Loop()
 
 		int WhatServer = -1;
 		int WhatClient = -1;
-		int WhatConnection = -1;
-		int WhatStream = -1;
+		int WhatConnection = 0;
 		int WhatStreamNumber = -1;
 		std::string rest;
 		std::string command;
@@ -1392,10 +1391,8 @@ void Loop()
 		app.add_option("-s,--server", WhatServer);
 		app.add_option("-c,--client", WhatClient);
 		app.add_option("-e,--connection", WhatConnection);
-		app.add_option("-r,--streamindex", WhatStream);
 		app.add_option("-b,--streamnumber", WhatStreamNumber);
-		app.add_option("rest", rest, "Remaining arguments")
-			->expected(-1);
+		app.add_option("rest", rest, "Remaining arguments")->expected(-1);
 		try
 		{
 			app.parse(cmd);
@@ -1407,61 +1404,77 @@ void Loop()
 			continue;
 		}
 
+		QuicServer* wsrv = 0;
+		QuicClient* wclt = 0;
+		QuicCommon* what = 0;
 		QuicConnection* wc = 0;
 		QuicStream* ws = 0;
-		if (WhatServer >= 0 && WhatServer < Servers.size())
+
+		if (WhatServer >= 0)
 		{
-			if (WhatConnection >= 0 && WhatConnection < Servers[WhatServer]->GetConnections().size())
+			for (auto& s : Servers)
 			{
-				wc = Servers[WhatServer]->GetConnections()[WhatConnection].get();
-			}
-			if (WhatConnection == -1 && Servers[WhatServer]->GetConnections().size() > 0)
-			{
-				wc = Servers[WhatServer]->GetConnections()[0].get();
-			}
-		}
-		if (WhatClient >= 0 && WhatClient < Clients.size())
-		{
-			if (WhatConnection >= 0 && WhatConnection < Clients[WhatClient]->GetConnections().size())
-			{
-				wc = Clients[WhatClient]->GetConnections()[WhatConnection].get();
-			}
-			if (WhatConnection == -1 && Clients[WhatClient]->GetConnections().size() > 0)
-			{
-				wc = Clients[WhatClient]->GetConnections()[0].get();
-			}
-		}
-		if (!wc)
-		{
-			if (Servers.size() > 0 && Servers[0]->GetConnections().size() > 0)
-			{
-				wc = Servers[0]->GetConnections()[0].get();
-			}
-			else
-				if (Clients.size() > 0 && Clients[0]->GetConnections().size() > 0)
+				if ((s->qsindex + 1) == WhatServer)
 				{
-					wc = Clients[0]->GetConnections()[0].get();
+					wsrv = s.get();
+					break;
 				}
+			}
 		}
+		if (WhatClient >= 0)
+		{
+			for (auto& c : Clients)
+			{
+				if ((c->qsindex + 1)== WhatClient)
+				{
+					wclt = c.get();
+					break;
+				}
+			}
+		}
+		if (wclt)
+			what = wclt;
+		else
+		if (wsrv)
+			what = wsrv;
+		if (!what)
+		{
+			if (Clients.size() > 0)
+				what = Clients[0].get();
+			else
+			if (Servers.size() > 0)
+				what = Servers[0].get();
+		}
+
+		if (what)
+		{
+			for (auto& conn : what->GetConnections())	
+			{
+				if ((conn->qsindex + 1) == WhatConnection)
+				{
+					wc = conn.get();
+					break;
+				}
+			}
+			if (!wc)
+			{
+				if (what->GetConnections().size() > 0)
+					wc = what->GetConnections()[0].get();
+			}
+		}
+
 
 		if (wc)
 		{
-			if (WhatStreamNumber >= 0)
+			for (auto& s : wc->Streams)
 			{
-				for (auto& s : wc->Streams)
+				if (s->StreamID == WhatStreamNumber)
 				{
-					if (s->StreamID == WhatStreamNumber)
-					{
-						ws = s.get();
-						break;
-					}
+					ws = s.get();
+					break;
 				}
 			}
-			if (ws == 0 && WhatStream >= 0 && WhatStream < wc->Streams.size())
-			{
-				ws = wc->Streams[WhatStream].get();
-			}
-			if (ws == 0 && WhatStream == -1 && wc->Streams.size() > 0)
+			if (ws == 0 && wc->Streams.size() > 0)
 			{
 				ws = wc->Streams[0].get();
 			}
@@ -1493,22 +1506,25 @@ void Loop()
 				{
 					sprintf_s(j->log, "Connection Streams: %d", (int)c->Streams.size());
 					std::cout << j->log << " ";
+					std::cout << j->log << std::endl;
 					for (auto& sx : c->Streams)
 					{
-						std::cout << sx->StreamID << (sx->Bi ? "B" : "U") << " ";
+						std::cout << "\t" << std::format("{:02}", sx->StreamID) << (sx->Bi ? " B " : " U ") << StreamTypeToStr(sx->SType) << std::endl;
 					}
-					std::cout << std::endl;
 				}
 			}
 		}
 
-		if (command == "start")
+		if (command == "start" || command == "ustart")
 		{
 			if (wc)
 			{
 				auto str = std::make_shared<QuicStream>(qt, wc->hConnection, nullptr,wc);
 				wc->Streams.push_back(str);
-				auto hr = qt->StreamOpen(wc->hConnection, QUIC_STREAM_OPEN_FLAG_NONE, [](_In_ HQUIC Stream, _In_opt_ void* Context, _Inout_ QUIC_STREAM_EVENT* Event)
+				QUIC_STREAM_OPEN_FLAGS flg = QUIC_STREAM_OPEN_FLAG_NONE;
+				if (command == "ustart")
+					flg = QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL;
+				auto hr = qt->StreamOpen(wc->hConnection, flg, [](_In_ HQUIC Stream, _In_opt_ void* Context, _Inout_ QUIC_STREAM_EVENT* Event)
 					{
 						QuicStream* session = (QuicStream*)Context;
 						if (session == 0)
@@ -1520,6 +1536,8 @@ void Loop()
 				if (FAILED(hr))
 					continue;
 				str->Bi = 1;
+				if (command == "ustart")
+					str->Bi = 0;
 				hr = qt->StreamStart(str->hStream, QUIC_STREAM_START_FLAG_NONE);
 				sprintf_s(str->log, "Starting stream on connection %p", wc->hConnection);
 				str->AddLog(hr, str->log);
@@ -1541,7 +1559,7 @@ void Loop()
 				memcpy(tbuffers->buffers[0].data.data(), rest.data(), rest.size());
 				tbuffers->buffers[0].Load();
 				auto hr = qt->DatagramSend(wc->hConnection,tbuffers->buffers.data(), 1, QUIC_SEND_FLAG_NONE, tbuffers);
-				sprintf_s(wc->log, "Sending datagram: %s", rest.c_str());
+				sprintf_s(wc->log, "[C%zi] Sending datagram: %s", wc->qsindex + 1, rest.c_str());
 				wc->AddLog(hr, wc->log);
 			}
 			else
